@@ -1,15 +1,28 @@
+import os
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from napari_plugin_engine import napari_hook_implementation
+
+
+TRACKS_HEADER = ('TrackID', 't', 'z', 'y', 'x')
 
 
 @napari_hook_implementation
 def napari_get_reader(path):
     if isinstance(path, list):
         path = path[0]
-
-    if not path.endswith(".csv"):
+    
+    if isinstance(path, str):
+        path = Path(path)
+    
+    if not path.name.endswith('.csv') or not os.path.exists(path):
         return None
+
+    header = pd.read_csv(path, index_col=0, nrows=0).columns.tolist()
+    for colname in TRACKS_HEADER:
+        if colname != 'z' and colname not in header:
+            return None
 
     return reader_function
 
@@ -17,10 +30,8 @@ def napari_get_reader(path):
 def read_csv(path: str):
     df = pd.read_csv(path)
 
-    tracks_header = ('TrackID', 't', 'z', 'y', 'x')
-
     data = []
-    for colname in tracks_header:
+    for colname in TRACKS_HEADER:
         try:
             data.append(df[colname])
         except KeyError:
@@ -32,7 +43,7 @@ def read_csv(path: str):
     props = {
         colname: df[colname]
         for colname in df.columns
-        if colname not in tracks_header
+        if colname not in TRACKS_HEADER
     }
     
     kwargs = {'properties': props}
@@ -40,5 +51,5 @@ def read_csv(path: str):
 
 
 def reader_function(path):
-    paths = [path] if isinstance(path, str) else path
+    paths = [path] if isinstance(path, (str, Path)) else path
     return [read_csv(p) for p in paths]
