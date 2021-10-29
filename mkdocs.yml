@@ -1,0 +1,11 @@
+site_name: track-utils
+site_description: Utility widgets for napari's track layer.
+site_author: Jordao Bragantini
+
+theme: readthedocs
+
+
+repo_url: https://github.com/jookuma/track-utils
+
+pages:
+- Home: index.md
