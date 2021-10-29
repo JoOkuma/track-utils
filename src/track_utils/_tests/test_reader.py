@@ -25,7 +25,7 @@ def test_reader(tmp_path):
     tracks = _build_tracks()
     tracks['NodeID'] = np.arange(len(tracks)) + 1
     tracks['Labels'] = np.random.randint(2, size=len(tracks))
-    tracks.to_csv(path)
+    tracks.to_csv(path, index=False)
 
     reader = napari_get_reader(path)
     assert callable(reader)
@@ -52,6 +52,6 @@ def test_wrong_columns_track(tmp_path: Path):
     tracks = _build_tracks()
     path = tmp_path / 'bad_tracks.csv'
     tracks.rename(columns={'TrackID': 'id'}, inplace=True)
-    tracks.to_csv(path)
+    tracks.to_csv(path, index=False)
     reader = napari_get_reader(path)
     assert reader is None

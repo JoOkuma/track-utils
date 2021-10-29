@@ -4,6 +4,7 @@ import napari
 from napari.layers import Tracks
 from magicgui.widgets import Container, create_widget, ComboBox, PushButton
 import numpy as np
+import numpy_indexed as npi
 
 
 class SplitTracks(Container):
@@ -16,7 +17,10 @@ class SplitTracks(Container):
         self._tracks_layer.changed.connect(self._validate_split_button)
         self.append(self._tracks_layer)
 
-        self._category = ComboBox(name='Category')
+        self._category = ComboBox(
+            name='Category',
+            choices=lambda _: () if self._tracks_layer.value is None else tuple(self._tracks_layer.value.properties.keys()),
+        )
         self.append(self._category)
 
         self._split_button = PushButton(text='Split', enabled=False)
@@ -48,9 +52,8 @@ class SplitTracks(Container):
         
         colname = self._category.value
         column = props[colname]
-
-        for key, indices in zip(np.unique(column, return_inverse=True)):
-            split_props = {k: v[indices] for k, v in props}
+        for key, indices in  zip(*npi.group_by(column, values=np.arange(len(column)))):
+            split_props = {k: v[indices] for k, v in props.items()}
             self._viewer.add_tracks(
                 data=tracks.data[indices, :],
                 name=f'{colname}_{key}',

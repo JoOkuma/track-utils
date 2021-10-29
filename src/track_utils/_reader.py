@@ -19,7 +19,7 @@ def napari_get_reader(path):
     if not path.name.endswith('.csv') or not os.path.exists(path):
         return None
 
-    header = pd.read_csv(path, index_col=0, nrows=0).columns.tolist()
+    header = pd.read_csv(path, nrows=0).columns.tolist()
     for colname in TRACKS_HEADER:
         if colname != 'z' and colname not in header:
             return None
