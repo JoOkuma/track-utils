@@ -8,7 +8,7 @@ import napari
 from napari.layers import Tracks, Layer
 from napari.utils.colormaps.standardize_color import _handle_str
 
-from magicgui.widgets import Container, create_widget, SpinBox, PushButton
+from magicgui.widgets import Container, create_widget, SpinBox, Slider, PushButton
 
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
@@ -98,7 +98,7 @@ class EditTracks(Container):
         self._node_t_trail_length = 10
         self._node_spatial_trail_length = 10
 
-        self._inspecting = True
+        self._reset_eval_tracking()
 
         self._load_button = PushButton(text='Load', enabled=False)
         self._load_button.changed.connect(self._on_load)
@@ -107,8 +107,8 @@ class EditTracks(Container):
         self._node_radius = SpinBox(max=100, value=10, label='Radius')
         self.append(self._node_radius)
 
-        self._spatial_range = SpinBox(max=500, value=self._spatial_filter.stack_range,
-                                      label='Spatial Range')
+        self._spatial_range = Slider(min=0, max=500, value=self._spatial_filter.stack_range,
+                                     label='Spatial Range')
         self._spatial_range.changed.connect(lambda e: setattr(self._spatial_filter, 'stack_range', e.value))
         self.append(self._spatial_range)
 
@@ -116,11 +116,16 @@ class EditTracks(Container):
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
     
     def _non_visible_spatial_axis(self) -> int:
-        return self._viewer.dims.order[-3]
+        return self._viewer.dims.order[-3] - 1
 
     def _is_2d(self) -> bool:
         return self._viewer.dims.ndisplay == 2
     
+    def _to_display(self, track: ArrayLike) -> ArrayLike:
+        track = np.atleast_2d(track)
+        track = track[:, np.array(self._viewer.dims.order[-3:]) - 1]  # reordering according to napari
+        return track[:, ::-1]  # reordering to vispy
+
     def _on_hover(self, layer: Tracks, event) -> None:
         if not self._inspecting or not self._is_2d():
             return
@@ -148,7 +153,7 @@ class EditTracks(Container):
         edge_color[:, -1] = relative_t[selected]
 
         self._hover_visual.set_data(
-            track[:, ::-1],
+            self._to_display(track),
             size=size,
             edge_width=self._node_edge_width,
             face_color='transparent',
@@ -156,22 +161,70 @@ class EditTracks(Container):
         )
         self._node.update()
     
-    def _on_drag(self, layer: Tracks, event) -> None:
+    def _on_double_click(self, layer: Tracks, event) -> None:
         if not self._is_2d():
             return
 
         coord = layer.world_to_data(np.array(event.position))
         index = self._get_index(layer, coord)
         if index is None:
-           return
+            pass
+
+        if self._inspecting:
+            self._select_node(index)
+    
+    @staticmethod
+    def _is_modified(event, modifier: str) -> bool:
+        return len(event.modifiers) == 1 and event.modifiers[0] == modifier
+    
+    def _on_drag(self, layer: Tracks, event) -> None:
+        if not self._is_2d():
+            return
+
+        if self._eval_track_id is not None and self._is_modified(event, 'Shift'):
+            displayed = np.array(self._viewer.dims.displayed, dtype=int)
+            self._is_moving = True
+            yield
+
+            while event.type == 'mouse_move':
+                coord = np.array(layer.world_to_data(np.array(event.position)))
+                self._eval_track[self._eval_relative_id, displayed] = coord[displayed]
+                self._set_eval_markers()
+                yield
+            
+            # TODO: optimize this
+            data = layer.data
+            data[self._eval_original_id, 1 + displayed] = coord[displayed]
+            layer.data = data
+            self._is_moving = False
+
+        else:
+            print('drag option not found')
         
+        """
+        elif different modes ...
+
+        with clicking:
+            MANUAL LINK MODE manually pick the next cell (must display both)
+        
+        with just an action:
+            CYCLE LINK MODE might be a better option,  show candidates, otherwise user must add an cell
+
+        other modes to think about:
+            to add an node, or multiple nodes sequentially
+        """
+    
+    def _select_node(self, index: int) -> None:
         self._inspecting = False
         self._make_empty(self._hover_visual)
 
+        layer = self._tracks_layer.value
         track_ids = layer._manager.track_ids
+        cur_time = layer._manager.track_times[index]
         self._eval_track_id = track_ids[index]
         self._eval_track = layer._manager.track_vertices[track_ids == self._eval_track_id]
-        self._eval_relative_id = np.where(self._eval_track[:, 0] == int(coord[0]))[0][0]
+        self._eval_original_id = index
+        self._eval_relative_id = np.where(self._eval_track[:, 0] == cur_time)[0][0]
         self._set_eval_markers()
 
     def _set_eval_markers(self, t_radius: int = 0) -> None:
@@ -189,7 +242,7 @@ class EditTracks(Container):
             size = (self._node_radius.value - 1) * scale + 1
 
         self._eval_visual.set_data(
-            np.atleast_2d(track)[:, ::-1],
+            self._to_display(track),
             face_color='transparent',
             edge_color='white',
             size=size,
@@ -204,6 +257,7 @@ class EditTracks(Container):
     def _center_to(self, coord: ArrayLike) -> None:
         layer = self._tracks_layer.value
         data_to_world = layer._transforms[1:3].simplified
+        # print(layer._transforms)
         self._viewer.dims.set_current_step(range(4), data_to_world(coord))
         
     def _make_empty(self, visual: Markers) -> None:
@@ -211,7 +265,13 @@ class EditTracks(Container):
       
     def _escape_eval_mode(self) -> None:
         self._make_empty(self._eval_visual)
+        self._reset_eval_tracking()
+
+    def _reset_eval_tracking(self) -> None:
         self._inspecting = True
+        self._eval_track_id = None
+        self._eval_track = None
+        self._eval_original_id = None
         self._eval_relative_id = None
     
     def _get_index(self, layer: Tracks, coord: ArrayLike, radius: int = 5) -> Optional[int]:
@@ -247,9 +307,20 @@ class EditTracks(Container):
     def _increment_eval_relative_index(self, step: int) -> None:
         if self._eval_relative_id is None:
             return
+        
+        new_id = self._eval_relative_id + step
+        if new_id < 0 or new_id >= len(self._eval_track):
+            return
 
-        self._eval_relative_id += step
-        self._eval_relative_id = min(max(self._eval_relative_id, 0), len(self._eval_track) - 1)
+        self._eval_relative_id = new_id
+        self._eval_original_id += step
+        self._set_eval_markers()
+
+    def _move_eval_on_non_visible_axis(self, float: int) -> None:
+        if not self._is_moving or self._eval_relative_id is None:
+            return
+
+        self._eval_track[self._eval_relative_id, self._non_visible_spatial_axis()] += float
         self._set_eval_markers()
     
     def _on_load(self) -> None:
@@ -272,12 +343,15 @@ class EditTracks(Container):
         self._node.add_subvisual(self._eval_visual)
 
         layer.events.rebuild_tracks.connect(self._on_tracks_change)
+        self._spatial_range.changed.connect(lambda _: layer.refresh())
 
+        layer.mouse_double_click_callbacks.append(self._on_double_click)
         layer.mouse_move_callbacks.append(self._on_hover)
         layer.mouse_drag_callbacks.append(self._on_drag)
 
         layer.bind_key('N', lambda _: self._increment_eval_relative_index(-1), overwrite=True)
         layer.bind_key('M', lambda _: self._increment_eval_relative_index(+1), overwrite=True)
+        layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
         layer.bind_key('Escape', lambda _: self._escape_eval_mode(), overwrite=True)
          
     def _on_layer_removed(self, layer: Layer) -> None:
@@ -311,3 +385,20 @@ class EditTracks(Container):
             self._spatial_filter.stack_range = self._spatial_range.value
             self._hover_visual.visible = True
    
+    def _delete_eval_node(self) -> None:
+        layer: Tracks = self._tracks_layer.value
+        if layer is None or self._eval_relative_id is None:
+            return
+
+        data = layer.data
+        if self._eval_relative_id < len(self._eval_track) - 1:
+            new_track_id = layer._manager.track_ids.max() + 1
+            last_half = data[self._eval_original_id + 1:]
+            last_half[last_half[:, 0] == self._eval_track_id, 0] = new_track_id  # splitting rest of the track
+            first_half = data[:self._eval_original_id]
+            data = np.concatenate((first_half, last_half), axis=0)
+        else:
+            data = np.delete(data, self._eval_original_id, axis=0)
+
+        layer.data = data
+        self._escape_eval_mode()
