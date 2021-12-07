@@ -1,16 +1,15 @@
 
-from sre_compile import dis
 from typing import Container, Optional
 
 import numpy as np
-from numpy.core.fromnumeric import argsort
 from numpy.typing import ArrayLike
 import napari
 
 from napari.layers import Tracks, Layer
+from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
 
-from magicgui.widgets import Container, create_widget, SpinBox, Slider, PushButton
+from magicgui.widgets import Container, create_widget, SpinBox, Slider, PushButton, CheckBox
 
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
@@ -102,6 +101,8 @@ class EditTracks(Container):
         self._reset_eval_tracking()
         self._reset_neighborhood()
 
+        self._setup_clipping_planes()
+
         self._load_button = PushButton(text='Load', enabled=False)
         self._load_button.changed.connect(self._on_load)
         self.append(self._load_button)
@@ -116,6 +117,14 @@ class EditTracks(Container):
 
         self._neighbor_radius = SpinBox(min=1, max=25, value=10, label='Neigh. Radius')
         self.append(self._neighbor_radius)
+
+        self._bounding_box = CheckBox(text='Bounding Box', value=False, enabled=False)
+        self._bounding_box.changed.connect(self._on_bounding_box_change)
+        self.append(self._bounding_box)
+
+        self._bbox_size = SpinBox(min=5, max=500, value=25, label='BBox Size')
+        self._bbox_size.changed.connect(lambda _: self._update_bbox_position())
+        self.append(self._bbox_size)
 
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
@@ -221,6 +230,9 @@ class EditTracks(Container):
         self._set_eval_markers()
 
     def _set_eval_markers(self, t_radius: int = 0) -> None:
+        if self._eval_relative_id is None:
+            return
+
         index = self._eval_relative_id
         self._center_to(self._eval_track[index])
 
@@ -252,8 +264,8 @@ class EditTracks(Container):
     def _center_to(self, coord: ArrayLike) -> None:
         layer = self._tracks_layer.value
         data_to_world = layer._transforms[1:3].simplified
-        # print(layer._transforms)
         self._viewer.dims.set_current_step(range(4), data_to_world(coord))
+        self._update_bbox_position()
         
     def _make_empty(self, visual: Markers) -> None:
         visual.set_data(np.empty((0, 3)))
@@ -303,6 +315,9 @@ class EditTracks(Container):
         self._load_neighborhood_visual()
     
     def _load_neighborhood_visual(self) -> None:
+        if self._neighbor_vertices is None:
+            return
+
         edge_color = np.empty((len(self._neighbor_vertices), 4), dtype=np.float32)
         edge_color[...] = _handle_str('yellow')[np.newaxis, ...]
         edge_color[self._neighbor_selected_id] = _handle_str('magenta')
@@ -428,7 +443,6 @@ class EditTracks(Container):
         self._update_current_slice()
         
     def _set_filter_stack(self) -> None:
-        print('track change')
         vertices = self._tracks_layer.value._manager.track_vertices
         self._spatial_filter.vertex_stack = vertices[:, self._non_visible_spatial_axis()]
     
@@ -444,12 +458,15 @@ class EditTracks(Container):
         if event.value == 3:
             self._spatial_filter.stack_range = 0
             self._hover_visual.visible = False
+            self._bounding_box.enabled = True
             if self._neighbor_original_ids is None:
                 self._neighbor_visual.visible = False
         else:
             self._spatial_filter.stack_range = self._spatial_range.value
             self._hover_visual.visible = True
             self._neighbor_visual.visible = True
+            self._bounding_box.value = False
+            self._bounding_box.enabled = False
         
         self._set_eval_markers()
         self._load_neighborhood_visual()
@@ -471,3 +488,39 @@ class EditTracks(Container):
 
         layer.data = data
         self._escape_eval_mode()
+
+    def _on_bounding_box_change(self, status: bool):
+        for layer in self._viewer.layers:
+            for plane in layer.experimental_clipping_planes:
+                plane.enabled = status
+            layer.refresh()
+    
+    def _update_bbox_position(self) -> None:
+        if self._eval_relative_id is None:
+            return
+        
+        coord = self._eval_track[self._eval_relative_id]
+        
+        for layer in self._viewer.layers:
+            for plane in layer.experimental_clipping_planes:
+                position = np.flip(coord[1:]) - np.array(plane.normal) * self._bbox_size.value / 2
+                plane.position = position
+            layer.refresh()
+        
+    def _setup_clipping_planes(self) -> None:
+        default_params = {
+            'position': np.zeros(3),
+            'normal': np.zeros(3),
+            'enabled': False,
+        }
+
+        bbox_planes = []
+        for axis in range(3):
+            for direction in (-1, 1):
+                params = default_params.copy()
+                params['normal'] = params['normal'].copy()
+                params['normal'][axis] = direction
+                bbox_planes.append(ClippingPlane(**params))
+        
+        for layer in self._viewer.layers:
+            layer.experimental_clipping_planes = bbox_planes
