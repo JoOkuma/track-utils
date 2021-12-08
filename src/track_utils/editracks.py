@@ -1,5 +1,5 @@
 
-from typing import Container, Optional
+from typing import Container, Optional, Dict, Any, Union
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -14,6 +14,8 @@ from magicgui.widgets import Container, create_widget, SpinBox, Slider, PushButt
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
 from vispy.visuals.filters import Filter
+
+import warnings
 
 
 class SpatialFilter(Filter):
@@ -195,8 +197,18 @@ class EditTracks(Container):
     def _on_drag(self, layer: Tracks, event) -> None:
         if not self._is_2d():
             return
-
+        
         if self._eval_track_id is not None and self._is_modified(event, 'Shift'):
+            coord = layer.world_to_data(np.array(event.position))
+            index = self._get_index(layer, coord)
+            if index != self._eval_original_id:
+                # forcing drag starts from selected data
+                return
+            
+            if self._eval_is_verified:
+                warnings.warn('Moving `verified` node is not allowed.')
+                return
+
             displayed = np.array(self._viewer.dims.displayed, dtype=int)
             self._is_moving = True
             yield
@@ -204,13 +216,11 @@ class EditTracks(Container):
             while event.type == 'mouse_move':
                 coord = np.array(layer.world_to_data(np.array(event.position)))
                 self._eval_track[self._eval_relative_id, displayed] = coord[displayed]
-                self._set_eval_markers()
+                self._load_eval_visual()
                 yield
             
-            # TODO: optimize this
-            data = layer.data
-            data[self._eval_original_id, 1 + displayed] = coord[displayed]
-            layer.data = data
+            layer._manager.data[self._eval_original_id, 1 + displayed] = coord[displayed]
+            layer._manager.build_tracks()
             self._is_moving = False
 
         else:
@@ -227,9 +237,9 @@ class EditTracks(Container):
         self._eval_track = layer._manager.track_vertices[track_ids == self._eval_track_id]
         self._eval_original_id = index
         self._eval_relative_id = np.where(self._eval_track[:, 0] == cur_time)[0][0]
-        self._set_eval_markers()
+        self._load_eval_visual()
 
-    def _set_eval_markers(self, t_radius: int = 0) -> None:
+    def _load_eval_visual(self, t_radius: int = 0) -> None:
         if self._eval_relative_id is None:
             return
 
@@ -239,16 +249,26 @@ class EditTracks(Container):
         if t_radius == 0:
             track = self._eval_track[index, 1:]
             size = self._node_radius.value
+            edge_color = 'green' if self._eval_is_verified else 'white'
         else:
             slicing = slice(max(0, index - t_radius), min(index + t_radius + 1, len(self._eval_track)))
             track = self._eval_track[slicing, 1:]
             scale = 1 - np.abs(np.arange(slicing.start, slicing.stop) - index) / t_radius
             size = (self._node_radius.value - 1) * scale + 1
 
+            original_slicing = slice(
+                slicing.start - self._eval_relative_id + self._eval_original_id,
+                slicing.stop - self._eval_relative_id + self._eval_original_id,
+            )
+ 
+            edge_color = np.empty((len(track), 4))
+            edge_color[...] = _handle_str('white')
+            edge_color[self._get_property(original_slicing, 'verified'), :] = _handle_str('green')
+
         self._eval_visual.set_data(
             self._to_display(track),
             face_color='transparent',
-            edge_color='white',
+            edge_color=edge_color,
             size=size,
             edge_width=self._node_edge_width,
         )
@@ -280,6 +300,7 @@ class EditTracks(Container):
         self._eval_track = None
         self._eval_original_id = None
         self._eval_relative_id = None
+        self._eval_is_verified = False
         self._make_empty(self._eval_visual)
 
     def _load_neighborhood(self, coord: ArrayLike, radius: int) -> None:
@@ -384,19 +405,18 @@ class EditTracks(Container):
 
         self._eval_relative_id = new_id
         self._eval_original_id += step
-        self._set_eval_markers()
+        self._eval_is_verified = self._get_property(self._eval_original_id, 'verified')
+        self._load_eval_visual()
 
-    def _move_eval_on_non_visible_axis(self, float: int) -> None:
-        if not self._is_moving or self._eval_relative_id is None:
-            return
-
-        self._eval_track[self._eval_relative_id, self._non_visible_spatial_axis()] += float
-        self._set_eval_markers()
-    
     def _on_load(self) -> None:
         layer: Tracks = self._tracks_layer.value
         if layer is None:
             return
+        
+        props = layer.properties
+        if 'verified' not in props:
+            props['verified'] = np.zeros(len(layer.data), dtype=bool)
+        layer.properties = props
         
         self._on_tracks_change()
 
@@ -423,6 +443,9 @@ class EditTracks(Container):
 
         layer.bind_key('N', lambda _: self._increment_eval_relative_index(-1), overwrite=True)
         layer.bind_key('M', lambda _: self._increment_eval_relative_index(+1), overwrite=True)
+
+        layer.bind_key('C', lambda _: self._set_verified_status(True), overwrite=True)
+        layer.bind_key('X', lambda _: self._set_verified_status(False), overwrite=True)
 
         layer.bind_key('K', lambda _: self._increment_neighbor_selected_index(-1), overwrite=True)
         layer.bind_key('L', lambda _: self._increment_neighbor_selected_index(+1), overwrite=True)
@@ -468,12 +491,16 @@ class EditTracks(Container):
             self._bounding_box.value = False
             self._bounding_box.enabled = False
         
-        self._set_eval_markers()
+        self._load_eval_visual()
         self._load_neighborhood_visual()
    
     def _delete_eval_node(self) -> None:
         layer: Tracks = self._tracks_layer.value
         if layer is None or self._eval_relative_id is None:
+            return
+        
+        if self._eval_is_verified:
+            warnings.warn('Deleting `verified` node is not allowed.')
             return
 
         data = layer.data
@@ -486,7 +513,12 @@ class EditTracks(Container):
         else:
             data = np.delete(data, self._eval_original_id, axis=0)
 
+        props = layer.properties
         layer.data = data
+        for k, v in props.items():
+            props[k] = np.delete(v, self._eval_original_id, axis=0)
+        layer.props = props
+
         self._escape_eval_mode()
 
     def _on_bounding_box_change(self, status: bool):
@@ -524,3 +556,40 @@ class EditTracks(Container):
         
         for layer in self._viewer.layers:
             layer.experimental_clipping_planes = bbox_planes
+
+    def _update_node_props(self, index: int, new_props: Dict) -> None:
+        layer: Tracks = self._tracks_layer.value
+        if layer is None:
+            raise RuntimeError('Tried to update properties when the layer was not available')
+
+        props = layer.properties
+        for k, v in new_props.items():
+            props[k][index] = v
+        
+        # hack: to avoid mixing up the tracks ordering
+        layer._manager._order = np.arange(len(layer.data))
+        layer.properties = props
+    
+    def _add_nodes_to_tracks(self, new_tracks: ArrayLike, new_props: Dict) -> None:
+        layer: Tracks = self._tracks_layer.value
+        if layer is None:
+            raise RuntimeError('Tried to append nodes to an empty layer')
+
+        props = layer.properties
+        data = layer.data
+        layer.data = np.append(data, new_tracks, axis=0)
+
+        merged_props = {}
+        for k, v in props.items():
+            merged_props[k] = np.append(v, new_props[k], axis=0)
+
+        layer.props = merged_props
+
+    def _get_property(self, indices: Union[ArrayLike, slice, int], key: str) -> Any:
+        layer: Tracks = self._tracks_layer.value
+        return layer.properties[key][indices]
+    
+    def _set_verified_status(self, status: bool) -> None:
+        self._update_node_props(self._eval_original_id, {'verified': status})
+        if status:
+            self._increment_eval_relative_index(1)
