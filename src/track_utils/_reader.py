@@ -1,6 +1,8 @@
 import os
 import pandas as pd
 import numpy as np
+import math as m
+
 from pathlib import Path
 from napari_plugin_engine import napari_hook_implementation
 
@@ -47,6 +49,15 @@ def read_csv(path: str):
     }
     
     kwargs = {'properties': props}
+
+    # optional step:
+    if 'ParentTrackID' in df.columns:
+        graph_df = df.drop_duplicates(('TrackID', 'ParentTrackID'))
+        kwargs['graph'] = {
+            track: [parent] for track, parent in zip(graph_df['TrackID'], graph_df['ParentTrackID'])
+            if not m.isnan(parent)
+        }
+
     return (data, kwargs, 'tracks')
 
 
