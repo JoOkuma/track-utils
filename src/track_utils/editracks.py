@@ -9,13 +9,20 @@ from napari.layers import Tracks, Layer
 from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
 
-from magicgui.widgets import Container, create_widget, SpinBox, Slider, PushButton, CheckBox
+from magicgui.widgets import (
+    Container, create_widget, SpinBox, Slider, PushButton, CheckBox,
+    FileEdit,
+)
 
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
 from vispy.visuals.filters import Filter
 
 import warnings
+
+from pathlib import Path
+
+from ._writer import tracks_to_dataframe
 
 
 class SpatialFilter(Filter):
@@ -117,6 +124,10 @@ class EditTracks(Container):
         self._spatial_range.changed.connect(lambda e: setattr(self._spatial_filter, 'stack_range', e.value))
         self.append(self._spatial_range)
 
+        self._neighbor_show = CheckBox(text='Display Neighbors', value=False, enabled=True)
+        self._neighbor_show.changed.connect(lambda _: self._load_neighborhood_visual())
+        self.append(self._neighbor_show)
+
         self._neighbor_radius = SpinBox(min=1, max=25, value=10, label='Neigh. Radius')
         self.append(self._neighbor_radius)
 
@@ -127,6 +138,10 @@ class EditTracks(Container):
         self._bbox_size = SpinBox(min=5, max=500, value=25, label='BBox Size')
         self._bbox_size.changed.connect(lambda _: self._update_bbox_position())
         self.append(self._bbox_size)
+
+        self._save_dialog = FileEdit(mode='w', filter='*.csv', label='Save Verified', enabled=False)
+        self._save_dialog.changed.connect(self._save_verified)
+        self.append(self._save_dialog)
 
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
@@ -336,7 +351,8 @@ class EditTracks(Container):
         self._load_neighborhood_visual()
     
     def _load_neighborhood_visual(self) -> None:
-        if self._neighbor_vertices is None:
+        if self._neighbor_show.value == False or self._neighbor_vertices is None:
+            self._make_empty(self._neighbor_visual)
             return
 
         edge_color = np.empty((len(self._neighbor_vertices), 4), dtype=np.float32)
@@ -411,6 +427,7 @@ class EditTracks(Container):
     def _on_load(self) -> None:
         layer: Tracks = self._tracks_layer.value
         if layer is None:
+            self._save_dialog.enabled = False
             return
         
         props = layer.properties
@@ -452,6 +469,8 @@ class EditTracks(Container):
 
         layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
         layer.bind_key('Escape', lambda _: self._escape_eval_mode(), overwrite=True)
+
+        self._save_dialog.enabled = True
          
     def _on_layer_removed(self, layer: Layer) -> None:
         if layer == self._tracks_layer.value:
@@ -593,3 +612,21 @@ class EditTracks(Container):
         self._update_node_props(self._eval_original_id, {'verified': status})
         if status:
             self._increment_eval_relative_index(1)
+
+    def _save_verified(self, path: Path) -> None:
+        if not path or not str(path).endswith('.csv'):
+            return
+        
+        layer: Tracks = self._tracks_layer.value
+
+        props = layer.properties
+        verified = props.pop('verified')
+
+        for k, v in props.items():
+            props[k] = v[verified]
+
+        data = layer.data[verified]
+
+        df = tracks_to_dataframe(data, props, layer.graph)
+        df.to_csv(path, index=False, header=True)
+    

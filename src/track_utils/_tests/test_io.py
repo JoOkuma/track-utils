@@ -1,18 +1,23 @@
 from pathlib import Path
 from track_utils import napari_get_reader
+from track_utils._writer import tracks_to_dataframe
 import numpy as np
 
 from .utils import build_tracks
 
 
-def test_reader(tmp_path):
+def test_io(tmp_path):
     reader = napari_get_reader('tracks.csv')
     assert reader is None
 
     path = tmp_path / 'good_tracks.csv'
     tracks = build_tracks()
-    tracks['NodeID'] = np.arange(len(tracks)) + 1
-    tracks['Labels'] = np.random.randint(2, size=len(tracks))
+
+    props = {}
+    props['NodeID'] = np.arange(len(tracks)) + 1
+    props['Labels'] = np.random.randint(2, size=len(tracks))
+
+    tracks = tracks_to_dataframe(tracks.values, props)
     tracks.to_csv(path, index=False)
 
     reader = napari_get_reader(path)
