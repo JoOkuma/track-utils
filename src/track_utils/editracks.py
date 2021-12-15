@@ -9,10 +9,11 @@ import napari
 from napari.layers import Tracks, Layer
 from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
+from napari.utils.events import EventedModel
 
 from magicgui.widgets import (
     Container, create_widget, SpinBox, Slider, PushButton, CheckBox,
-    FileEdit,
+    FileEdit, Textarea
 )
 
 from vispy.gloo import VertexBuffer
@@ -24,6 +25,29 @@ import warnings
 from pathlib import Path
 
 from ._writer import tracks_to_dataframe
+
+
+class StatsManager(EventedModel):
+    n_tracks: int = 0
+    n_nodes: int = 0
+    n_add: int = 0
+    n_deleted: int = 0
+    n_verified: int = 0
+
+    _stats_tlpt = '# Tracks {n_tracks}\n' \
+                  '# Nodes {n_nodes}\n' \
+                  '# Additions {n_add}\n' \
+                  '# Deleted {n_deleted}\n' \
+                  '# Verified {n_verified}'
+    
+    def __str__(self) -> str:
+        return self._stats_tlpt.format(
+            n_tracks=self.n_tracks,
+            n_nodes=self.n_nodes,
+            n_add=self.n_add,
+            n_deleted=self.n_deleted,
+            n_verified=self.n_verified,
+        )
 
 
 @dataclass
@@ -94,6 +118,7 @@ class SpatialFilter(Filter):
     def vertex_stack(self, value: ArrayLike) -> None:
         self._vertex_stack = np.array(value).astype(np.float32)
         self.vshader['a_vertex_stack'] = VertexBuffer(self.vertex_stack)
+
 
 
 class EditTracks(Container):
@@ -170,6 +195,18 @@ class EditTracks(Container):
         self._save_dialog = FileEdit(mode='w', filter='*.csv', label='Save Verified', enabled=False)
         self._save_dialog.changed.connect(self._save_verified)
         self.append(self._save_dialog)
+
+        self._stats = Textarea(label='Stats', enabled=False)
+        self.append(self._stats)
+
+        self._stats_manager = StatsManager()       
+        self._stats_manager.events.n_tracks.connect(self._update_stats)
+        self._stats_manager.events.n_nodes.connect(self._update_stats)
+        self._stats_manager.events.n_add.connect(self._update_stats)
+        self._stats_manager.events.n_deleted.connect(self._update_stats)
+        self._stats_manager.events.n_verified.connect(self._update_stats)
+
+        self._update_stats()
 
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
@@ -474,6 +511,7 @@ class EditTracks(Container):
         if 'verified' not in props:
             props['verified'] = np.zeros(len(layer.data), dtype=bool)
         layer.properties = props
+        self._stats_manager.n_verified = props['verified'].sum()
         
         self._on_tracks_change()
 
@@ -492,6 +530,10 @@ class EditTracks(Container):
         for visual in aux_visuals:
             self._node.add_subvisual(visual)
 
+        layer.events.rebuild_graph.connect(self._update_stats_n_tracks)
+        self._update_stats_n_tracks()
+
+        layer.events.rebuild_graph.connect(self._on_tracks_change)
         layer.events.rebuild_tracks.connect(self._on_tracks_change)
         self._spatial_range.changed.connect(lambda _: layer.refresh())
 
@@ -507,6 +549,8 @@ class EditTracks(Container):
 
         layer.bind_key('K', lambda _: self._increment_neighbor_selected_index(-1), overwrite=True)
         layer.bind_key('L', lambda _: self._increment_neighbor_selected_index(+1), overwrite=True)
+        layer.bind_key('A', lambda _: self._add_link_to_neigh(), overwrite=True)
+        # layer.bind_key('S', lambda _: self._switch_link_to_neigh(), overwrite=True)
 
         layer.bind_key('F', lambda _: self._focus_to_current_track(), overwrite=True)
         layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
@@ -606,6 +650,7 @@ class EditTracks(Container):
         layer.properties = props
         layer.graph = graph
 
+        self._stats_manager.n_deleted += 1
         self._escape_eval_mode()
 
     def _on_bounding_box_change(self, status: bool):
@@ -687,6 +732,10 @@ class EditTracks(Container):
         node.verified = status
         if node.original_id is not None:
             self._set_property('verified', node.original_id, status)
+            if status:
+                self._stats_manager.n_verified += 1
+            else:
+                self._stats_manager.n_verified -= 1
 
         if status:
             self._increment_time(1 - 2 * self._backward_incr.value)
@@ -736,13 +785,16 @@ class EditTracks(Container):
     def _eval_to_new_track(self) -> Tuple[ArrayLike, Dict]:
 
         vertices = np.array([n.coord for n in self._eval_nodes.values()])
-        vertices = vertices[np.argsort(vertices[:, 0])]
+        ordering = np.argsort(vertices[:, 0])
+        vertices = vertices[ordering]
         size = len(vertices)
         tracks = np.insert(vertices, 0, np.full(size, self._eval_track_id), axis=1)
 
         keys = self._tracks_layer.value.properties.keys()
         props = {k: np.zeros(size) for k in keys}
-        props['verified'] = np.ones(size, dtype=bool)
+        props['verified'] = np.array([
+            n.verified or n.original_id is None for n in self._eval_nodes.values()
+        ])[ordering]
 
         return tracks, props
 
@@ -768,6 +820,8 @@ class EditTracks(Container):
         layer.properties = props
         layer.graph = graph
 
+        self._stats_manager.n_add += sum([n.original_id is None for n in self._eval_nodes.values()])
+
         self._reset_eval_tracking()
 
     def _cancel_addition(self) -> None:
@@ -785,13 +839,24 @@ class EditTracks(Container):
         track_id = self.track_ids[index]
         if index < (len(self.track_ids) - 1) and track_id == self.track_ids[index + 1]:
             return True
-
+        
         graph = self._tracks_layer.value.graph
         return any(parent[0] == track_id for parent in graph.values())
       
     def _link_nodes(self, current: int, neighbor: int) -> None:
+        layer: Tracks = self._tracks_layer.value
+        self._link_nodes_from_data(current, neighbor,
+            layer.data, layer.graph, layer.properties)
+
+    def _link_nodes_from_data(self, current: int, neighbor: int,
+        data: ArrayLike, graph: Dict, props: Dict) -> None:
+
         if self._is_adding:
             warnings.warn('Cannot link nodes during `add` mode.')
+            return
+        
+        if self._get_property('verified', neighbor):
+            warnings.warn('Cannot link to `verified` node.')
             return
         
         track_ids = self.track_ids
@@ -799,18 +864,16 @@ class EditTracks(Container):
         neigh_track_id = track_ids[neighbor]
         if cur_track_id == neigh_track_id:
             return
-        
+
         if self._has_parent(neighbor):
             warnings.warn('Neighbor is already connected to a node.')
             return
         
         layer: Tracks = self._tracks_layer.value
-        graph = layer.graph
-        data = layer.data
 
         if self._has_child(current):
             # updating subsequent vertices of track if necessary
-            selected, = np.nonzero(data[:, 0] == cur_track_id and data[:, 1] > data[current, 1])
+            selected = np.nonzero(np.logical_and(data[:, 0] == cur_track_id, data[:, 1] > data[current, 1]))
             # this will not ocurr when the childs are mapped in the graph and not the tracks data
             if len(selected) > 0:
                 new_track_id = self._new_track_id()
@@ -828,13 +891,104 @@ class EditTracks(Container):
             self._update_graph_parent(graph, neigh_track_id, cur_track_id)
             data[data[:, 0] == neigh_track_id, 0] = cur_track_id
 
-        props = layer.properties
         layer.data = data
         layer.graph = graph
         layer.properties = props
+        self._select_node(current)
 
     @staticmethod
     def _update_graph_parent(graph: Dict, old_parent: int, new_parent: int) -> None:
         for node in list(graph.keys()):
             if graph[node][0] == old_parent:
                 graph[node] = [new_parent]
+    
+    def _validate_link_to_neigh(self) -> bool:
+        if not self._neighbor_show.value or len(self._neighbor_original_ids) == 0:
+            return False
+        
+        if self._eval_node.original_id is None:
+            warnings.warn('Only confirmed tracks allow linkage.')
+            return False
+
+        return True
+
+    def _add_link_to_neigh(self):
+        if not self._validate_link_to_neigh():
+            return
+       
+        neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
+        self._link_nodes(self._eval_node.original_id, neigh_id)
+
+    def _switch_link_to_neigh(self):
+        raise NotImplementedError
+        """There is an issue with the indexing of the data
+           after the split because the data is sorted we lose our index.
+        """
+        if not self._validate_link_to_neigh():
+            return
+        
+        neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
+        if self.track_ids[neigh_id] == self.track_ids[self._eval_node.original_id]:
+            # alredy linked
+            return
+
+        self._split_after(self._eval_node.original_id)
+        self._split_before(neigh_id)
+        self._link_nodes_from_data(self._eval_node.original_id, neigh_id)
+    
+    def _split_after(self, index: int) -> None:
+        self._split_track(index, before=False)
+
+    def _split_before(self, index: int) -> None:
+        self._split_track(index, before=True)
+     
+    def _split_track(self, index: int, before: bool = False) -> None:
+        layer: Tracks = self._tracks_layer.value
+
+        graph = layer.graph
+        data = layer.data
+
+        track_id = self.track_ids[index]
+        new_track_id = self._new_track_id()
+
+        if before:
+            mask = data[:, 1] < data[index, 1]
+        else:
+            mask = data[:, 1] > data[index, 1]
+
+        mask = np.logical_and(mask, data[:, 0] == track_id)
+
+        if mask.sum() > 0:
+            data[mask, 0]  = new_track_id
+            if before:
+                if track_id in graph:
+                    graph[new_track_id] = graph.pop(track_id)
+            else:
+                self._update_graph_parent(graph, track_id, new_track_id)
+        else:
+            if before:
+                # removing parent
+                 if track_id in graph:
+                    del graph[track_id]
+            else:
+                # removing children
+                for node in list(graph.keys()):
+                    if graph[node][0] == track_id:
+                        del graph[node]
+        
+        props = layer.properties
+        layer.data = data
+        layer.graph = graph
+        layer.properties = props
+
+    def _update_stats(self, event=None) -> None:
+        self._stats.value = str(self._stats_manager)
+        # TODO implement auto backup
+    
+    def _update_stats_n_tracks(self, event=None) -> None:
+        layer: Tracks = self._tracks_layer.value
+        if layer is None:
+            return
+        
+        self._stats_manager.n_tracks = len(layer._manager)
+        self._stats_manager.n_nodes = len(layer.data)
