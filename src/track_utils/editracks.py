@@ -120,7 +120,6 @@ class SpatialFilter(Filter):
         self.vshader['a_vertex_stack'] = VertexBuffer(self.vertex_stack)
 
 
-
 class EditTracks(Container):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
