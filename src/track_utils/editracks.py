@@ -1,12 +1,12 @@
 
-from typing import Container, Optional, Dict, Any, Union, Tuple
-from dataclasses import dataclass
+from typing import Callable, Container, Optional, List
 
 import numpy as np
 from numpy.typing import ArrayLike
 import napari
 
 from napari.layers import Tracks, Layer
+from napari.layers.tracks._managers._interactive_track_manager import Node, InteractiveTrackManager
 from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
 from napari.utils.events import EventedModel
@@ -48,13 +48,6 @@ class StatsManager(EventedModel):
             n_deleted=self.n_deleted,
             n_verified=self.n_verified,
         )
-
-
-@dataclass
-class Node:
-    coord: ArrayLike
-    verified: bool = False
-    original_id: Optional[int] = None
 
 
 class SpatialFilter(Filter):
@@ -116,7 +109,7 @@ class SpatialFilter(Filter):
     
     @vertex_stack.setter
     def vertex_stack(self, value: ArrayLike) -> None:
-        self._vertex_stack = np.array(value).astype(np.float32)
+        self._vertex_stack = np.asarray(value).astype(np.float32)
         self.vshader['a_vertex_stack'] = VertexBuffer(self.vertex_stack)
 
 
@@ -130,6 +123,8 @@ class EditTracks(Container):
 
         self._tracks_layer = create_widget(annotation=Tracks, name='Tracks')
         self.append(self._tracks_layer)
+
+        self._pending_additions = []
 
         self._hover_visual = Markers(scaling=True)
         self._eval_visual = Markers(scaling=True)
@@ -181,6 +176,7 @@ class EditTracks(Container):
         self._addition_mode = PushButton(text='Add New Track', enabled=True)
         self._addition_mode.changed.connect(lambda _: setattr(self, '_is_adding', True))
         self._addition_mode.changed.connect(lambda _: setattr(self, '_inspecting', False))
+        self._addition_mode.changed.connect(lambda _: setattr(self, '_eval_node', None))
 
         self.append(self._addition_mode)
         self._add_confirm = PushButton(text='Confirm')
@@ -209,30 +205,47 @@ class EditTracks(Container):
 
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
-    
+
     def _non_visible_spatial_axis(self) -> int:
-        return self._viewer.dims.order[-3] - 1
+        return self._viewer.dims.order[-3]
 
     def _is_2d(self) -> bool:
         return self._viewer.dims.ndisplay == 2
     
     def _to_display(self, track: ArrayLike) -> ArrayLike:
         track = np.atleast_2d(track)
-        track = track[:, np.array(self._viewer.dims.order[-3:]) - 1]  # reordering according to napari
+        track = track[:, np.asarray(self._viewer.dims.order[-3:]) - 1]  # reordering according to napari
         return track[:, ::-1]  # reordering to vispy
+    
+    @staticmethod
+    def _get_node_predecessors(node: Node, max_depth: int = 500) -> List[Node]:
+        current_time = node.time
+        predecessors = []
+        queue = [node]
+
+        while len(queue) > 0:
+            node = queue.pop()
+            predecessors.append(node)
+
+            for parent in node.parents:
+                if current_time - parent.time < max_depth:
+                    queue.append(parent)
+
+        return predecessors
 
     def _on_hover(self, layer: Tracks, event) -> None:
         if not self._inspecting or not self._is_2d():
             return
 
-        coord = layer.world_to_data(np.array(event.position))
+        coord = layer.world_to_data(np.asarray(event.position))
         index = self._get_index(layer, coord)
         if index is None:
             self._make_empty(self._hover_visual)
             return
-
-        track_ids = layer._manager.track_ids
-        track = layer._manager.track_vertices[track_ids == track_ids[index]]
+        
+        node = layer._manager._get_node(index)
+        preds = self._get_node_predecessors(node, self._node_t_trail_length)
+        track = np.stack([n.vertex for n in preds])
 
         relative_t = ((track[:, 0] - coord[0]) + self._node_t_trail_length) / self._node_t_trail_length
         selected = np.logical_and(relative_t > 0, relative_t <= 1.0)
@@ -260,9 +273,18 @@ class EditTracks(Container):
         if not self._is_2d():
             return
 
-        coord = layer.world_to_data(np.array(event.position))
+        coord = layer.world_to_data(np.asarray(event.position))
         if self._is_adding:
-            self._add_node(coord)
+            index = layer._manager.add(coord, {'verified': True})
+            self._pending_additions.append(index)
+            if self._eval_node is not None:
+                if self._eval_node.vertex[0] < coord[0]:
+                    parent, child = self._eval_node.index, index
+                else:
+                    parent, child = index, self._eval_node.index
+                self._manager.link(parent, child)
+            self._eval_node = self._get_node(index)
+            self._increment_time(1 - 2 * self._backward_incr.value)
             self._load_eval_visual()
             return
 
@@ -281,77 +303,54 @@ class EditTracks(Container):
         if not self._is_2d():
             return
         
-        if self._eval_track_id is not None and self._is_modified(event, 'Shift'):
-            coord = layer.world_to_data(np.array(event.position))
+        if self._eval_node is not None and self._is_modified(event, 'Shift'):
+            coord = layer.world_to_data(np.asarray(event.position))
 
             # FIXME: THIS WORKS, napari's transforms needs to be fixed
             # if np.linalg.norm(coord[1:] - self._eval_node.coord[1:]) > 5:
             #     # forcing drag starts from selected data
             #     return
             
-            displayed = np.array(self._viewer.dims.displayed, dtype=int)
+            displayed = np.asarray(self._viewer.dims.displayed, dtype=int)
             self._is_moving = True
             yield
 
-            index = self._eval_node.original_id
             while event.type == 'mouse_move':
-                coord = np.array(layer.world_to_data(np.array(event.position)))
-                self._eval_nodes[int(coord[0])].coord = coord
-                if index is not None:
-                    self._tracks_layer.value.data[index, displayed + 1] = coord[displayed]
-
+                coord = np.asarray(layer.world_to_data(np.asarray(event.position)))
+                self._eval_node.vertex[displayed] = coord[displayed]
+                self._manager._is_serialized = False
+                self._manager._view_time_slice = (0, -1)  # invalidate slicing
                 self._load_eval_visual()
                 yield
             
-            layer._manager.build_tracks()
             self._is_moving = False
 
     def _select_node(self, index: int) -> None:
         self._inspecting = False
         self._make_empty(self._hover_visual)
 
-        layer = self._tracks_layer.value
-        track_ids = layer._manager.track_ids
-        self._eval_track_id = track_ids[index]
-
-        selected, = np.nonzero(track_ids == self._eval_track_id)
-        vertices = self.track_vertices[selected]
-        verified = self._tracks_layer.value.properties['verified'][selected]
-
-        self._eval_nodes = {
-            int(c[0]): Node(coord=c, verified=v, original_id=i)
-            for i, v, c in zip(selected, verified, vertices)
-        }
+        self._eval_node = self._get_node(index)
 
         self._load_eval_visual()
-    
-    @property
-    def track_vertices(self) -> ArrayLike:
-        return self._tracks_layer.value._manager.track_vertices
-
-    @property
-    def track_ids(self) -> ArrayLike:
-        return self._tracks_layer.value._manager.track_ids
 
     def _load_eval_visual(self) -> bool:
         node = self._eval_node
-        if node is None:
+        time = self._viewer.dims.point[0]
+        if node is None or abs(node.time - time) > 1:
             self._make_empty(self._eval_visual)
             return False
 
-        if node.original_id is None:
-            edge_color = 'cyan'
-        elif node.verified:
+        elif node.features.get('verified', False):
             edge_color = 'green'
         else:
             edge_color = 'white'
 
-        self._center_to(node.coord)
+        self._center_to(node.vertex)
 
         size = self._node_radius.value
 
         self._eval_visual.set_data(
-            self._to_display(node.coord[1:]),
+            self._to_display(node.vertex[1:]),
             face_color='transparent',
             edge_color=edge_color,
             size=size,
@@ -359,7 +358,7 @@ class EditTracks(Container):
         )
         self._node.update()
 
-        next_coord = node.coord + np.array([1, 0, 0, 0])
+        next_coord = node.vertex + np.asarray([1, 0, 0, 0])
         self._load_neighborhood(next_coord, self._neighbor_radius.value)
         return True
     
@@ -370,15 +369,11 @@ class EditTracks(Container):
     def _center_to(self, coord: ArrayLike) -> None:
         layer = self._tracks_layer.value
         data_to_world = layer._transforms[1:3].simplified
-        self._viewer.dims.set_current_step(range(4), data_to_world(coord))
+        self._viewer.dims.set_point(range(4), data_to_world(coord))
         self._update_bbox_position()
         
     def _make_empty(self, visual: Markers) -> None:
         visual.set_data(np.empty((0, 3)))
-    
-    def _is_valid_index(self, index: int) -> bool:
-        return (0 <= index < len(self.track_ids) and
-            self.track_ids[index] == self._eval_track_id)
     
     @property
     def current_t(self) -> int:
@@ -388,19 +383,15 @@ class EditTracks(Container):
         assert len(step) == 4
         return int(self._tracks_layer.value.world_to_data(step)[0])
 
-    @property
-    def _eval_node(self) -> Optional[Node]:
-        return self._eval_nodes.get(self.current_t)
-      
     def _escape_eval_mode(self) -> None:
         self._reset_eval_tracking()
         self._reset_neighborhood()
 
     def _reset_eval_tracking(self) -> None:
         self._inspecting = True
-        self._eval_track_id = None
-        self._eval_nodes = {}
+        self._eval_node = None
         self._is_adding = False
+        self._pending_additions.clear()
         self._make_empty(self._eval_visual)
 
     def _load_neighborhood(self, coord: ArrayLike, radius: int) -> None:
@@ -408,30 +399,31 @@ class EditTracks(Container):
         if layer is None:
             return
 
-        coord = np.array(coord)
+        coord = np.asarray(coord)
 
-        selected, = np.nonzero(np.abs(layer._manager.track_times - coord[0]) < 1)
+        nodes = layer._manager._time_to_nodes[int(round(coord[0]))]
 
-        if len(selected) == 0:
+        if len(nodes) == 0:
             self._reset_neighborhood()
             return
 
-        track_vertices = layer._manager.track_vertices[selected]
+        track_vertices = np.stack([node.vertex for node in nodes])
         distances = np.linalg.norm(track_vertices[:, 1:] - coord[np.newaxis, 1:], axis=1)
         
         neighbors_mask = distances < radius
-        distances = distances[neighbors_mask]
-        selected = selected[neighbors_mask]
-        if len(selected) == 0:
+        if neighbors_mask.sum() == 0:
             self._reset_neighborhood()
             return
 
-        indices = np.argsort(distances)
-        selected = selected[indices]
+        distances = distances[neighbors_mask]
+        track_vertices = track_vertices[neighbors_mask]
 
-        self._neighbor_original_ids = selected
+        indices = np.argsort(distances)
+        ordered_indices = np.nonzero(neighbors_mask)[0][indices]
+
+        self._neighbor_original_ids = [nodes[i].index for i in ordered_indices]
         self._neighbor_selected_id = 0
-        self._neighbor_vertices = layer._manager.track_vertices[selected]
+        self._neighbor_vertices = track_vertices[indices]
 
         self._load_neighborhood_visual()
     
@@ -467,51 +459,70 @@ class EditTracks(Container):
         self._make_empty(self._neighbor_visual)
     
     def _get_index(self, layer: Tracks, coord: ArrayLike, radius: int = 5) -> Optional[int]:
-        coord = np.array(coord)
+        coord = np.asarray(coord)
 
-        track_vertices = layer._manager.track_vertices
-        non_vis_axis = self._non_visible_spatial_axis()
-
-        selected, = np.nonzero(np.logical_and(
-            np.abs(layer._manager.track_times - coord[0]) < 1,
-            np.abs(track_vertices[:, non_vis_axis] - coord[non_vis_axis]) < self._spatial_range.value
-        ))
-
-        if len(selected) == 0:
-            return None
-
-        visible_axis = np.array(self._viewer.dims.displayed, dtype=int)
-        
-        closest = np.argmin(
-            np.abs(
-                track_vertices[selected][:, visible_axis] - coord[visible_axis]
-            ).sum(axis=1)
-        )
-        index = selected[closest]
+        index = layer.get_value(coord)
         distance = np.linalg.norm(
-            layer._manager.track_vertices[index, visible_axis] - coord[visible_axis]
+            layer._manager._id_to_nodes[index].vertex - coord
         )
+
         if distance > radius:
             return None
         
         return index
     
+    def _get_node(self, index: int) -> Node:
+        layer: Tracks = self._tracks_layer.value
+        return layer._manager._get_node(index)
+    
+    @staticmethod
+    def _search_time_point(node: Node, time: int, neigh_fun: Callable) -> Node:
+
+        queue = [node]
+
+        min_dist = 1e6
+        nearest = node
+
+        while len(queue) > 0:
+            node = queue.pop(0)
+
+            dist = abs(node.time - time)
+            if dist < 1:
+                return node
+
+            elif dist < min_dist:
+                nearest = node
+            
+            for neigh in neigh_fun(node):
+                queue.append(neigh)
+
+        return nearest
+    
     def _increment_time(self, step: int) -> None:
         self._viewer.dims.set_current_step(0, self._viewer.dims.current_step[0] + step)
+        time = self._viewer.dims.point[0]
+        if self._eval_node:
+            if step > 0:
+                self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
+            else:
+                self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
+
         self._load_eval_visual()
 
     def _on_load(self) -> None:
         layer: Tracks = self._tracks_layer.value
+        layer.editable = True
+
         if layer is None:
             self._save_dialog.enabled = False
             return
         
-        props = layer.properties
-        if 'verified' not in props:
-            props['verified'] = np.zeros(len(layer.data), dtype=bool)
-        layer.properties = props
-        self._stats_manager.n_verified = props['verified'].sum()
-        
+        features = layer.features
+        if 'verified' in features.columns:
+            self._stats_manager.n_verified = features['verified'].sum()
+        else:
+            self._stats_manager.n_verified = 0
+
         self._on_tracks_change()
 
         aux_visuals = [self._hover_visual, self._eval_visual, self._neighbor_visual]
@@ -529,7 +540,8 @@ class EditTracks(Container):
         for visual in aux_visuals:
             self._node.add_subvisual(visual)
 
-        layer.events.rebuild_graph.connect(self._update_stats_n_tracks)
+        # FIXME: disabled this to avoid serialization
+        # layer.events.rebuild_graph.connect(self._update_stats_n_tracks)
         self._update_stats_n_tracks()
 
         layer.events.rebuild_graph.connect(self._on_tracks_change)
@@ -549,7 +561,7 @@ class EditTracks(Container):
         layer.bind_key('K', lambda _: self._increment_neighbor_selected_index(-1), overwrite=True)
         layer.bind_key('L', lambda _: self._increment_neighbor_selected_index(+1), overwrite=True)
         layer.bind_key('A', lambda _: self._add_link_to_neigh(), overwrite=True)
-        # layer.bind_key('S', lambda _: self._switch_link_to_neigh(), overwrite=True)
+        layer.bind_key('S', lambda _: self._switch_link_to_neigh(), overwrite=True)
 
         layer.bind_key('F', lambda _: self._focus_to_current_track(), overwrite=True)
         layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
@@ -571,9 +583,9 @@ class EditTracks(Container):
         self._update_current_slice()
         
     def _set_filter_stack(self) -> None:
-        vertices = self._tracks_layer.value._manager.track_vertices
-        g_vertices = self._tracks_layer.value._manager.graph_vertices
-        self._vertices_spatial_filter.vertex_stack = vertices[:, self._non_visible_spatial_axis()]
+        layer: Tracks =  self._tracks_layer.value
+        g_vertices = layer._view_graph_vertices
+        self._vertices_spatial_filter.vertex_stack = layer._view_track_vertices[:, self._non_visible_spatial_axis()]
         if g_vertices is not None:
             self._graph_spatial_filter.vertex_stack = g_vertices[:, self._non_visible_spatial_axis()]
     
@@ -582,7 +594,7 @@ class EditTracks(Container):
         if layer is None:
             return
 
-        coord = layer.world_to_data(self._viewer.dims.current_step)
+        coord = layer.world_to_data(self._viewer.dims.point)
         self._vertices_spatial_filter.current_stack = coord[self._non_visible_spatial_axis()]
         self._graph_spatial_filter.current_stack = coord[self._non_visible_spatial_axis()]
     
@@ -615,39 +627,15 @@ class EditTracks(Container):
     def _delete_eval_node(self) -> None:
         """Delete node and splits the path"""
         layer: Tracks = self._tracks_layer.value
-        if layer is None or self._eval_track_id is None:
+        if layer is None or self._eval_node is None:
             return
         
         node = self._eval_node
-        if node.verified:
+        if node.features.get('verified', False):
             warnings.warn('Deleting `verified` node is not allowed.')
             return
         
-        if node.original_id is None:
-            return self._eval_nodes.pop(int(node.coord[0]))
-        
-        graph = layer.graph
-        data = layer.data
-
-        first_half = data[:node.original_id]
-        last_half = data[node.original_id + 1:]
-        last_mask = last_half[:, 0] == self._eval_track_id
-
-        if last_mask.sum() > 0:
-            new_track_id = layer._manager.track_ids.max() + 1
-            last_half[last_mask, 0] = new_track_id  # splitting rest of the track
-            self._update_graph_parent(graph, self._eval_track_id, new_track_id)
-        else:
-            graph = {k: v for k, v in graph.items() if v[0] != self._eval_track_id}
-
-        data = np.concatenate((first_half, last_half), axis=0)
-
-        props = layer.properties
-        layer.data = data
-        for k, v in props.items():
-            props[k] = np.delete(v, node.original_id, axis=0)
-        layer.properties = props
-        layer.graph = graph
+        layer._manager.remove(node.index)
 
         self._stats_manager.n_deleted += 1
         self._escape_eval_mode()
@@ -663,10 +651,10 @@ class EditTracks(Container):
         if node is None:
             return
         
-        coord = node.coord
+        coord = node.vertex
         for layer in self._viewer.layers:
             for plane in layer.experimental_clipping_planes:
-                position = np.flip(coord[1:]) - np.array(plane.normal) * self._bbox_size.value / 2
+                position = np.flip(coord[1:]) - np.asarray(plane.normal) * self._bbox_size.value / 2
                 plane.position = position
             layer.refresh()
         
@@ -688,56 +676,17 @@ class EditTracks(Container):
         for layer in self._viewer.layers:
             layer.experimental_clipping_planes = bbox_planes
 
-    def _update_node_props(self, index: int, new_props: Dict) -> None:
-        layer: Tracks = self._tracks_layer.value
-        if layer is None:
-            raise RuntimeError('Tried to update properties when the layer was not available')
-
-        props = layer.properties
-        for k, v in new_props.items():
-            props[k][index] = v
-        
-        # hack: to avoid mixing up the tracks ordering
-        layer._manager._order = np.arange(len(layer.data))
-        layer.properties = props
-    
-    def _add_nodes_to_tracks(self, new_tracks: ArrayLike, new_props: Dict) -> None:
-        layer: Tracks = self._tracks_layer.value
-        if layer is None:
-            raise RuntimeError('Tried to append nodes to an empty layer')
-
-        graph = layer.graph
-        props = layer.properties
-        data = layer.data
-        layer.data = np.append(data, new_tracks, axis=0)
-
-        merged_props = {}
-        for k, v in props.items():
-            merged_props[k] = np.append(v, new_props[k], axis=0)
-
-        layer.properties = merged_props
-        layer.graph = graph
-
-    def _get_property(self, key: str, indices: Union[ArrayLike, slice, int]) -> Any:
-        layer: Tracks = self._tracks_layer.value
-        return layer.properties[key][indices]
-
-    def _set_property(self, key: str, indices: Union[ArrayLike, slice, int], value: Any) -> None:
-        layer: Tracks = self._tracks_layer.value
-        layer.properties[key][indices] = value
-     
     def _set_verified_status(self, status: bool) -> None:
         node = self._eval_node
-        node.verified = status
-        if node.original_id is not None:
-            self._set_property('verified', node.original_id, status)
-            if status:
-                self._stats_manager.n_verified += 1
-            else:
-                self._stats_manager.n_verified -= 1
+        if node is None:
+            return
 
+        node.features['verified'] = status
         if status:
+            self._stats_manager.n_verified += 1
             self._increment_time(1 - 2 * self._backward_incr.value)
+        else:
+            self._stats_manager.n_verified -= 1
 
     def _save_verified(self, path: Path) -> None:
         if not path or not str(path).endswith('.csv'):
@@ -745,241 +694,69 @@ class EditTracks(Container):
         
         layer: Tracks = self._tracks_layer.value
 
-        props = layer.properties
-        verified = props.pop('verified')
+        features = layer.features
+        verified = features['verified']
 
-        for k, v in props.items():
-            props[k] = v[verified]
-
+        features = features.drop('verified', axis='columns', inplace=False)
         data = layer.data[verified]
 
-        df = tracks_to_dataframe(data, props, layer.graph)
+        df = tracks_to_dataframe(data, features, layer.graph)
         df.to_csv(path, index=False, header=True)
     
     def _focus_to_current_track(self) -> None:
-        if self._eval_track_id is None:
+        if self._eval_node is None:
             return
+        
+        time = self._viewer.dims.point[0]
+        if time < self._eval_node.time:
+            self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
+        else:
+            self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
 
-        vertices = np.array([n.coord for n in self._eval_nodes.values()])
-        argmin = np.argmin(np.abs(vertices[:, 0] - self.current_t))
-
-        self._center_to(vertices[argmin])
+        self._center_to(self._eval_node.vertex)
         self._load_eval_visual()
     
-    def _new_track_id(self) -> int:
-        return self._tracks_layer.value._manager.track_ids.max() + 1
- 
-    def _add_node(self, coord: ArrayLike) -> ArrayLike:
-        coord = np.array(coord)
-        if self._eval_track_id is None:
-            self._eval_track_id = self._new_track_id()
-
-        if int(coord[0]) in self._eval_nodes:
-            warnings.warn('Adding multiple nodes to a unique time point is not allowed')
-            return
-        
-        self._eval_nodes[int(coord[0])] = Node(coord, verified=False)
-        self._increment_time(1 - 2 * self._backward_incr.value)
-    
-    def _eval_to_new_track(self) -> Tuple[ArrayLike, Dict]:
-
-        vertices = np.array([n.coord for n in self._eval_nodes.values()])
-        ordering = np.argsort(vertices[:, 0])
-        vertices = vertices[ordering]
-        size = len(vertices)
-        tracks = np.insert(vertices, 0, np.full(size, self._eval_track_id), axis=1)
-
-        keys = self._tracks_layer.value.properties.keys()
-        props = {k: np.zeros(size) for k in keys}
-        props['verified'] = np.array([
-            n.verified or n.original_id is None for n in self._eval_nodes.values()
-        ])[ordering]
-
-        return tracks, props
-
     def _confirm_addition(self) -> None:
-        layer: Tracks = self._tracks_layer.value
-        if layer is None or self._eval_track_id is None:
-            return
-
-        # updated new track
-        new_track, new_props = self._eval_to_new_track()
-
-        # removing old track and added new track
-        props = layer.properties
-        data = layer.data
-        selected = layer._manager.track_ids != self._eval_track_id
-
-        for k, v in props.items():
-            props[k] = np.append(v[selected], new_props[k], axis=0)
-        
-        graph = layer.graph
-
-        layer.data = np.append(data[selected], new_track, axis=0)
-        layer.properties = props
-        layer.graph = graph
-
-        self._stats_manager.n_add += sum([n.original_id is None for n in self._eval_nodes.values()])
-
+        self._stats_manager.n_add += len(self._pending_additions)
         self._reset_eval_tracking()
 
     def _cancel_addition(self) -> None:
+        layer: Tracks = self._tracks_layer.value
+        if layer is None:
+            return
+
+        for index in self._pending_additions:
+            layer._manager.remove(index)
+
         self._reset_eval_tracking()
 
-    def _has_parent(self, index: int) -> bool:
-        track_id = self.track_ids[index]
-        if index > 0 and track_id == self.track_ids[index - 1]:
-            return True
-
-        layer: Tracks = self._tracks_layer.value
-        return track_id in layer.graph
-
-    def _has_child(self, index: int) -> bool:
-        track_id = self.track_ids[index]
-        if index < (len(self.track_ids) - 1) and track_id == self.track_ids[index + 1]:
-            return True
-        
-        graph = self._tracks_layer.value.graph
-        return any(parent[0] == track_id for parent in graph.values())
-      
-    def _link_nodes(self, current: int, neighbor: int) -> None:
-        layer: Tracks = self._tracks_layer.value
-        self._link_nodes_from_data(current, neighbor,
-            layer.data, layer.graph, layer.properties)
-
-    def _link_nodes_from_data(self, current: int, neighbor: int,
-        data: ArrayLike, graph: Dict, props: Dict) -> None:
-
-        if self._is_adding:
-            warnings.warn('Cannot link nodes during `add` mode.')
-            return
-        
-        if self._get_property('verified', neighbor):
-            warnings.warn('Cannot link to `verified` node.')
-            return
-        
-        track_ids = self.track_ids
-        cur_track_id = track_ids[current]
-        neigh_track_id = track_ids[neighbor]
-        if cur_track_id == neigh_track_id:
-            return
-
-        if self._has_parent(neighbor):
-            warnings.warn('Neighbor is already connected to a node.')
-            return
-        
-        layer: Tracks = self._tracks_layer.value
-
-        if self._has_child(current):
-            # updating subsequent vertices of track if necessary
-            selected = np.nonzero(np.logical_and(data[:, 0] == cur_track_id, data[:, 1] > data[current, 1]))
-            # this will not ocurr when the childs are mapped in the graph and not the tracks data
-            if len(selected) > 0:
-                new_track_id = self._new_track_id()
-
-                # updating old track id parents
-                self._update_graph_parent(graph, cur_track_id, new_track_id)
-
-                data[selected, 0] = new_track_id
-                graph[new_track_id] = [cur_track_id]
-
-            # setting new split
-            graph[neigh_track_id] = [cur_track_id]
-
-        else:
-            self._update_graph_parent(graph, neigh_track_id, cur_track_id)
-            data[data[:, 0] == neigh_track_id, 0] = cur_track_id
-
-        layer.data = data
-        layer.graph = graph
-        layer.properties = props
-        self._select_node(current)
-
-    @staticmethod
-    def _update_graph_parent(graph: Dict, old_parent: int, new_parent: int) -> None:
-        for node in list(graph.keys()):
-            if graph[node][0] == old_parent:
-                graph[node] = [new_parent]
-    
     def _validate_link_to_neigh(self) -> bool:
-        if not self._neighbor_show.value or len(self._neighbor_original_ids) == 0:
-            return False
-        
-        if self._eval_node.original_id is None:
-            warnings.warn('Only confirmed tracks allow linkage.')
-            return False
-
-        return True
+        return self._neighbor_show.value and len(self._neighbor_original_ids) > 0
+    
+    @property
+    def _manager(self) -> InteractiveTrackManager:
+        layer: Tracks = self._tracks_layer.value
+        return layer._manager
 
     def _add_link_to_neigh(self):
         if not self._validate_link_to_neigh():
             return
        
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
-        self._link_nodes(self._eval_node.original_id, neigh_id)
+        self._manager.link(neigh_id, self._eval_node.index)
 
     def _switch_link_to_neigh(self):
-        raise NotImplementedError
-        """There is an issue with the indexing of the data
-           after the split because the data is sorted we lose our index.
-        """
         if not self._validate_link_to_neigh():
             return
         
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
-        if self.track_ids[neigh_id] == self.track_ids[self._eval_node.original_id]:
-            # alredy linked
-            return
 
-        self._split_after(self._eval_node.original_id)
-        self._split_before(neigh_id)
-        self._link_nodes_from_data(self._eval_node.original_id, neigh_id)
+        for child in self._eval_node.children:
+            child.parents.remove(self._eval_node)
+
+        self._eval_node.children.clear()
+        self._manager.link(neigh_id, self._eval_node.index)
     
-    def _split_after(self, index: int) -> None:
-        self._split_track(index, before=False)
-
-    def _split_before(self, index: int) -> None:
-        self._split_track(index, before=True)
-     
-    def _split_track(self, index: int, before: bool = False) -> None:
-        layer: Tracks = self._tracks_layer.value
-
-        graph = layer.graph
-        data = layer.data
-
-        track_id = self.track_ids[index]
-        new_track_id = self._new_track_id()
-
-        if before:
-            mask = data[:, 1] < data[index, 1]
-        else:
-            mask = data[:, 1] > data[index, 1]
-
-        mask = np.logical_and(mask, data[:, 0] == track_id)
-
-        if mask.sum() > 0:
-            data[mask, 0]  = new_track_id
-            if before:
-                if track_id in graph:
-                    graph[new_track_id] = graph.pop(track_id)
-            else:
-                self._update_graph_parent(graph, track_id, new_track_id)
-        else:
-            if before:
-                # removing parent
-                 if track_id in graph:
-                    del graph[track_id]
-            else:
-                # removing children
-                for node in list(graph.keys()):
-                    if graph[node][0] == track_id:
-                        del graph[node]
-        
-        props = layer.properties
-        layer.data = data
-        layer.graph = graph
-        layer.properties = props
-
     def _update_stats(self, event=None) -> None:
         self._stats.value = str(self._stats_manager)
         # TODO implement auto backup

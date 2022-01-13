@@ -77,3 +77,8 @@ target/
 
 # written by setuptools_scm
 **/_version.py
+
+
+# VS code
+.history
+.vscode

@@ -1,6 +1,6 @@
 import numpy as np
 
-from .utils import build_tracks
+from track_utils._tests.utils import build_tracks
 import track_utils
 
 MY_PLUGIN_NAME = "track-utils"
