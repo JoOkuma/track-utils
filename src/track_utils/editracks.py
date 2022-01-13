@@ -11,10 +11,7 @@ from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
 from napari.utils.events import EventedModel
 
-from magicgui.widgets import (
-    Container, create_widget, SpinBox, Slider, PushButton, CheckBox,
-    FileEdit, Textarea
-)
+from magicgui.widgets import Container, create_widget, Slider, PushButton, CheckBox, FileEdit, Textarea
 
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
@@ -146,7 +143,8 @@ class EditTracks(Container):
         self._load_button.changed.connect(self._on_load)
         self.append(self._load_button)
 
-        self._node_radius = SpinBox(max=100, value=10, label='Node Radius')
+        self._node_radius = Slider(min=0, max=100, value=10, label='Node Radius')
+        self._node_radius.changed.connect(lambda _: self._load_eval_visual())
         self.append(self._node_radius)
 
         self._spatial_range = Slider(min=0, max=500, value=self._vertices_spatial_filter.stack_range,
@@ -159,14 +157,15 @@ class EditTracks(Container):
         self._neighbor_show.changed.connect(lambda _: self._load_neighborhood_visual())
         self.append(self._neighbor_show)
 
-        self._neighbor_radius = SpinBox(min=1, max=25, value=10, label='Neigh. Radius')
+        self._neighbor_radius = Slider(min=1, max=25, value=10, label='Neigh. Radius')
+        self._neighbor_radius.changed.connect(lambda _: self._load_eval_visual())
         self.append(self._neighbor_radius)
 
         self._bounding_box = CheckBox(text='Bounding Box', value=False, enabled=False)
         self._bounding_box.changed.connect(self._on_bounding_box_change)
         self.append(self._bounding_box)
 
-        self._bbox_size = SpinBox(min=5, max=500, value=25, label='BBox Size')
+        self._bbox_size = Slider(min=5, max=500, value=25, label='BBox Size')
         self._bbox_size.changed.connect(lambda _: self._update_bbox_position())
         self.append(self._bbox_size)
 
@@ -284,8 +283,7 @@ class EditTracks(Container):
                     parent, child = index, self._eval_node.index
                 self._manager.link(parent, child)
             self._eval_node = self._get_node(index)
-            self._increment_time(1 - 2 * self._backward_incr.value)
-            self._load_eval_visual()
+            self._increment_time()
             return
 
         index = self._get_index(layer, coord)
@@ -401,7 +399,7 @@ class EditTracks(Container):
 
         coord = np.asarray(coord)
 
-        nodes = layer._manager._time_to_nodes[int(round(coord[0]))]
+        nodes = layer._manager._time_to_nodes.get(int(round(coord[0])), [])
 
         if len(nodes) == 0:
             self._reset_neighborhood()
@@ -498,8 +496,16 @@ class EditTracks(Container):
 
         return nearest
     
-    def _increment_time(self, step: int) -> None:
+    def _increment_time(self, step: Optional[int] = None) -> None:
+        if step is None:
+            # if step is not provided it increments given the direction
+            step = 1 - 2 * self._backward_incr.value
+        
+        print('step', step)
+        print('before', self._viewer.dims.current_step, self._viewer.dims.point)
         self._viewer.dims.set_current_step(0, self._viewer.dims.current_step[0] + step)
+        print('after', self._viewer.dims.current_step, self._viewer.dims.point)
+
         time = self._viewer.dims.point[0]
         if self._eval_node:
             if step > 0:
@@ -603,7 +609,7 @@ class EditTracks(Container):
             self._vertices_spatial_filter.stack_range = 0
             self._graph_spatial_filter.stack_range = 0
             self._hover_visual.visible = False
-            if self._eval_track_id is None:
+            if self._eval_node is None:
                 self._eval_visual.visible = False
             self._bounding_box.enabled = True
             if self._neighbor_original_ids is None:
@@ -654,7 +660,7 @@ class EditTracks(Container):
         coord = node.vertex
         for layer in self._viewer.layers:
             for plane in layer.experimental_clipping_planes:
-                position = np.flip(coord[1:]) - np.asarray(plane.normal) * self._bbox_size.value / 2
+                position = coord[1:] - np.asarray(plane.normal) * self._bbox_size.value / 2
                 plane.position = position
             layer.refresh()
         
@@ -680,13 +686,17 @@ class EditTracks(Container):
         node = self._eval_node
         if node is None:
             return
+        
+        if node.features.get('verified') == status:
+            return
 
         node.features['verified'] = status
         if status:
             self._stats_manager.n_verified += 1
-            self._increment_time(1 - 2 * self._backward_incr.value)
+            self._increment_time()
         else:
             self._stats_manager.n_verified -= 1
+            self._load_eval_visual()
 
     def _save_verified(self, path: Path) -> None:
         if not path or not str(path).endswith('.csv'):
@@ -729,6 +739,7 @@ class EditTracks(Container):
             layer._manager.remove(index)
 
         self._reset_eval_tracking()
+        layer.events.rebuild_tracks()
 
     def _validate_link_to_neigh(self) -> bool:
         return self._neighbor_show.value and len(self._neighbor_original_ids) > 0
