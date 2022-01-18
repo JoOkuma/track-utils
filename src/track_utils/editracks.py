@@ -13,6 +13,8 @@ from napari.utils.events import EventedModel
 
 from magicgui.widgets import Container, create_widget, Slider, PushButton, CheckBox, FileEdit, Textarea
 
+from qtpy.QtWidgets import QMessageBox
+
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
 from vispy.visuals.filters import Filter
@@ -138,6 +140,7 @@ class EditTracks(Container):
         self._is_adding = False
 
         self._setup_clipping_planes()
+        self._viewer.layers.events.inserted.connect(self._add_clipping_plane)
 
         self._load_button = PushButton(text='Load', enabled=False)
         self._load_button.changed.connect(self._on_load)
@@ -178,9 +181,9 @@ class EditTracks(Container):
         self._addition_mode.changed.connect(lambda _: setattr(self, '_eval_node', None))
 
         self.append(self._addition_mode)
-        self._add_confirm = PushButton(text='Confirm')
+        self._add_confirm = PushButton(text='Confirm', enabled=False)
         self._add_confirm.changed.connect(lambda _: self._confirm_addition())
-        self._add_cancel = PushButton(text='Cancel')
+        self._add_cancel = PushButton(text='Cancel', enabled=False)
         self._add_cancel.changed.connect(lambda _: self._cancel_addition())
  
         container = Container(layout='horizontal', widgets=[self._add_confirm, self._add_cancel], label='Addition: ')
@@ -281,9 +284,11 @@ class EditTracks(Container):
                     parent, child = self._eval_node.index, index
                 else:
                     parent, child = index, self._eval_node.index
-                self._manager.link(parent, child)
+                self._manager.link(child, parent)
             self._eval_node = self._get_node(index)
             self._increment_time()
+            self._add_confirm.enabled = True
+            self._add_cancel.enabled = True
             return
 
         index = self._get_index(layer, coord)
@@ -319,6 +324,7 @@ class EditTracks(Container):
                 self._manager._is_serialized = False
                 self._manager._view_time_slice = (0, -1)  # invalidate slicing
                 self._load_eval_visual()
+                self._center_to(self._eval_node.vertex)
                 yield
             
             self._is_moving = False
@@ -329,12 +335,13 @@ class EditTracks(Container):
 
         self._eval_node = self._get_node(index)
 
+        self._center_to(self._eval_node.vertex)
         self._load_eval_visual()
 
     def _load_eval_visual(self) -> bool:
         node = self._eval_node
         time = self._viewer.dims.point[0]
-        if node is None or abs(node.time - time) > 1:
+        if node is None or abs(node.time - time) >= 1:
             self._make_empty(self._eval_visual)
             return False
 
@@ -342,8 +349,6 @@ class EditTracks(Container):
             edge_color = 'green'
         else:
             edge_color = 'white'
-
-        self._center_to(node.vertex)
 
         size = self._node_radius.value
 
@@ -382,8 +387,10 @@ class EditTracks(Container):
         return int(self._tracks_layer.value.world_to_data(step)[0])
 
     def _escape_eval_mode(self) -> None:
+        if self._addition_mode:
+            self._cancel_addition()
         self._reset_eval_tracking()
-        self._reset_neighborhood()
+        self._neighbor_show.value = False
 
     def _reset_eval_tracking(self) -> None:
         self._inspecting = True
@@ -426,12 +433,21 @@ class EditTracks(Container):
         self._load_neighborhood_visual()
     
     def _load_neighborhood_visual(self) -> None:
-        if self._neighbor_show.value == False or self._neighbor_vertices is None:
+        if not self._neighbor_show.value or self._neighbor_vertices is None:
             self._make_empty(self._neighbor_visual)
             return
+        
+        self._neighbor_visual.visible = True
 
         edge_color = np.empty((len(self._neighbor_vertices), 4), dtype=np.float32)
         edge_color[...] = _handle_str('yellow')[np.newaxis, ...]
+
+        # coloring orphan nodes
+        manager = self._manager
+        for i, node_id in enumerate(self._neighbor_original_ids):
+            if len(manager._id_to_nodes[node_id].parents) == 0:
+                edge_color[i] = _handle_str('cyan')
+
         edge_color[self._neighbor_selected_id] = _handle_str('magenta')
 
         self._neighbor_visual.set_data(
@@ -496,22 +512,22 @@ class EditTracks(Container):
 
         return nearest
     
-    def _increment_time(self, step: Optional[int] = None) -> None:
+    def _increment_time(self, step: Optional[int] = None, center: bool = False) -> None:
         if step is None:
             # if step is not provided it increments given the direction
             step = 1 - 2 * self._backward_incr.value
         
-        print('step', step)
-        print('before', self._viewer.dims.current_step, self._viewer.dims.point)
-        self._viewer.dims.set_current_step(0, self._viewer.dims.current_step[0] + step)
-        print('after', self._viewer.dims.current_step, self._viewer.dims.point)
-
-        time = self._viewer.dims.point[0]
-        if self._eval_node:
+        time = self._viewer.dims.point[0] + step
+        if self._eval_node is not None:
             if step > 0:
                 self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
             else:
                 self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
+            
+            if center and time == self._eval_node.time:
+                self._center_to(self._eval_node.vertex)
+        
+        self._viewer.dims.set_current_step(0, time)
 
         self._load_eval_visual()
 
@@ -558,16 +574,18 @@ class EditTracks(Container):
         layer.mouse_move_callbacks.append(self._on_hover)
         layer.mouse_drag_callbacks.append(self._on_drag)
 
-        layer.bind_key('N', lambda _: self._increment_time(-1), overwrite=True)
-        layer.bind_key('M', lambda _: self._increment_time(+1), overwrite=True)
+        layer.bind_key('N', lambda _: self._increment_time(-1, center=True), overwrite=True)
+        layer.bind_key('M', lambda _: self._increment_time(+1, center=True), overwrite=True)
 
         layer.bind_key('C', lambda _: self._set_verified_status(True), overwrite=True)
         layer.bind_key('X', lambda _: self._set_verified_status(False), overwrite=True)
 
         layer.bind_key('K', lambda _: self._increment_neighbor_selected_index(-1), overwrite=True)
         layer.bind_key('L', lambda _: self._increment_neighbor_selected_index(+1), overwrite=True)
+
         layer.bind_key('A', lambda _: self._add_link_to_neigh(), overwrite=True)
         layer.bind_key('S', lambda _: self._switch_link_to_neigh(), overwrite=True)
+        layer.bind_key('U', lambda _: self._unlink_parent(), overwrite=True)
 
         layer.bind_key('F', lambda _: self._focus_to_current_track(), overwrite=True)
         layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
@@ -612,7 +630,7 @@ class EditTracks(Container):
             if self._eval_node is None:
                 self._eval_visual.visible = False
             self._bounding_box.enabled = True
-            if self._neighbor_original_ids is None:
+            if not self._validate_link_to_neigh():
                 self._neighbor_visual.visible = False
 
             if self._node._subvisuals[2].bounds(0) is None:
@@ -644,6 +662,7 @@ class EditTracks(Container):
         layer._manager.remove(node.index)
 
         self._stats_manager.n_deleted += 1
+        self._stats_manager.n_nodes -= 1
         self._escape_eval_mode()
 
     def _on_bounding_box_change(self, status: bool):
@@ -671,16 +690,19 @@ class EditTracks(Container):
             'enabled': False,
         }
 
-        bbox_planes = []
+        self._bbox_planes = []
         for axis in range(3):
             for direction in (-1, 1):
                 params = default_params.copy()
                 params['normal'] = params['normal'].copy()
                 params['normal'][axis] = direction
-                bbox_planes.append(ClippingPlane(**params))
+                self._bbox_planes.append(ClippingPlane(**params))
         
         for layer in self._viewer.layers:
-            layer.experimental_clipping_planes = bbox_planes
+            layer.experimental_clipping_planes = self._bbox_planes
+    
+    def _add_clipping_plane(self, event) -> None:
+        event.value.experimental_clipping_planes = self._bbox_planes
 
     def _set_verified_status(self, status: bool) -> None:
         node = self._eval_node
@@ -693,7 +715,7 @@ class EditTracks(Container):
         node.features['verified'] = status
         if status:
             self._stats_manager.n_verified += 1
-            self._increment_time()
+            self._increment_time(center=True)
         else:
             self._stats_manager.n_verified -= 1
             self._load_eval_visual()
@@ -729,7 +751,9 @@ class EditTracks(Container):
     def _confirm_addition(self) -> None:
         self._stats_manager.n_add += len(self._pending_additions)
         self._reset_eval_tracking()
-
+        self._add_confirm.enabled = False
+        self._add_cancel.enabled = False
+ 
     def _cancel_addition(self) -> None:
         layer: Tracks = self._tracks_layer.value
         if layer is None:
@@ -740,9 +764,15 @@ class EditTracks(Container):
 
         self._reset_eval_tracking()
         layer.events.rebuild_tracks()
+        self._add_confirm.enabled = False
+        self._add_cancel.enabled = False
 
     def _validate_link_to_neigh(self) -> bool:
-        return self._neighbor_show.value and len(self._neighbor_original_ids) > 0
+        return (
+            self._neighbor_show.value and
+            self._neighbor_original_ids is not None and
+            len(self._neighbor_original_ids) > 0
+        )
     
     @property
     def _manager(self) -> InteractiveTrackManager:
@@ -754,19 +784,39 @@ class EditTracks(Container):
             return
        
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
-        self._manager.link(neigh_id, self._eval_node.index)
+        if len(self._get_node(neigh_id).parents) > 0:
+            msg_box = QMessageBox()
+            answer = msg_box.question(
+                None, "",
+                f"Node {neigh_id} already have a parent.\nDo you want to unlink it?",
+                msg_box.Yes | msg_box.No,
+            )
+            if answer == msg_box.No:
+                return
+            self._manager.unlink(neigh_id, None)
 
-    def _switch_link_to_neigh(self):
+        self._manager.link(neigh_id, self._eval_node.index)
+        self._manager._view_time_slice = (0, -1)  # invalidate slicing
+        self._tracks_layer.value.refresh()
+    
+    def _unlink_parent(self) -> None:
+        if self._eval_node is None:
+            return
+        
+        self._manager.unlink(self._eval_node.index, None)
+
+    def _switch_link_to_neigh(self) -> None:
         if not self._validate_link_to_neigh():
             return
         
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
 
-        for child in self._eval_node.children:
-            child.parents.remove(self._eval_node)
+        self._manager.unlink(None, self._eval_node.index)
+        self._manager.unlink(neigh_id, None)
 
-        self._eval_node.children.clear()
         self._manager.link(neigh_id, self._eval_node.index)
+        self._manager._view_time_slice = (0, -1)  # invalidate slicing
+        self._tracks_layer.value.refresh()
     
     def _update_stats(self, event=None) -> None:
         self._stats.value = str(self._stats_manager)
