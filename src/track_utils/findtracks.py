@@ -2,10 +2,10 @@
 from typing import Callable, Optional
 
 import numpy as np
-import pandas as pd
 
 import napari
 from napari.layers.tracks import Tracks
+from napari.layers.tracks._managers._interactive_track_manager import Node
 
 from qtpy.QtWidgets import QWidget, QVBoxLayout
 from psygnal import Signal
@@ -59,12 +59,18 @@ class FindTracks(QWidget):
         self._layout.addWidget(container.native)
 
         self._props_plotter = PropertyPlotter(self._viewer)
-        self._props_plotter.data_selector.new_selection.connect(self.on_selection_changed)
+        self._props_plotter.data_selector.new_selection.connect(self.on_plot_selection_changed)
         self._layout.addWidget(self._props_plotter)
         self._displayed_track_id = NO_TRACK
 
         self._index_changed.connect(self._validate_buttons)
         self._index_changed.connect(self._select_node)
+
+        track_editor = self._edit_tracks_widget()
+        if track_editor is not None:
+            pass
+        
+        track_editor.events.selected_node.connect(self.on_canvas_selection_changed)
 
     def _edit_tracks_widget(self) -> Optional[EditTracks]:
         dock_widget = self._viewer.window._dock_widgets.get('track-utils: Edit Tracks')
@@ -72,7 +78,27 @@ class FindTracks(QWidget):
             return dock_widget.widget()._magic_widget
         return None
     
-    def on_selection_changed(self, value=None) -> None:
+    def _get_node(self, index: int) -> Node:
+        manager = self._track_layer_combobox.value._manager
+        return manager._get_node(index)
+    
+    def on_canvas_selection_changed(self, event) -> None:
+        if event.value is None:
+            return
+
+        node = event.value
+        if self._displayed_track_id != node.features.get('track_id'):
+            # if df haven't been set yet
+            self.plot_node_subtree(node.index)
+
+        selection = self._props_plotter.data_selector.sele
+        if selection is None:
+            return
+
+        self._props_plotter.picker.x_picker.setCurrentText('time')
+        selection.setValue(float(event.value.time))
+
+    def on_plot_selection_changed(self, value=None) -> None:
         if value is None:
             return
         track_editor = self._edit_tracks_widget()
@@ -82,8 +108,7 @@ class FindTracks(QWidget):
         argmin = np.argmin(np.abs(x_prop - value))
         
         index = self._props_plotter.picker.df['index'].iloc[argmin]
-        track_editor._escape_eval_mode()
-        track_editor._select_node(index)
+        track_editor.selected_node = self._get_node(index)
 
     def _select_node(self) -> None:
         selected_index = self._nodes_id_ordering[self._ordering_index]
@@ -94,30 +119,19 @@ class FindTracks(QWidget):
         self.plot_node_subtree(selected_index)
 
         try:
-            track_editor._escape_eval_mode()
-            track_editor._select_node(selected_index)
+            track_editor.selected_node = self._get_node(selected_index)
         except IndexError:
             pass
     
-    def align_variable_selection(self, node_index: int) -> None:
-        manager = self._track_layer_combobox.value._manager
-        selection = self._props_plotter.data_selector.sele
-        if  selection is not None:
-            node = manager._get_node(node_index)
-            selection.setValue(node.time)
-
     def plot_node_subtree(self, index: int) -> None:
         if self._track_layer_combobox.value is None:
             return
-        
+
         manager = self._track_layer_combobox.value._manager
         df = manager._connected_component(index, return_df=True)
-        if df['track_id'].iloc[0] == self._displayed_track_id:
-            return
 
         df.set_index('index', inplace=True)  # hack necessary, picker reverts this
-        speed = difference(df, ['z', 'y', 'x'])
-        df['speed'] = speed
+        df['moviment'] = difference(df, ['z', 'y', 'x'])
         df = df.astype(float)
         self._props_plotter.picker.set_dataframe(df)
         self._props_plotter.picker.x_picker.setCurrentText('time')
@@ -144,8 +158,3 @@ class FindTracks(QWidget):
     def _validate_buttons(self) -> None:
         self._next_button.enabled = self._ordering_index + 1 < len(self._nodes_id_ordering)
         self._prev_button.enabled = self._ordering_index - 1 >= 0
-    
-    def reset_choices(self) -> None:
-        print('RESET CHOICES')
-        self.search_priority.reset_choices()
-    
