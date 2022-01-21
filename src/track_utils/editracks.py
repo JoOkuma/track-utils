@@ -6,7 +6,7 @@ from numpy.typing import ArrayLike
 import napari
 
 from napari.layers import Tracks, Layer
-from napari.layers.tracks._managers._interactive_track_manager import Node, InteractiveTrackManager
+from napari.layers.tracks._managers._interactive_track_manager import Node, InteractiveTrackManager, INVALID_TIME_SLICE
 from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
 from napari.utils.events import EventedModel
@@ -297,6 +297,9 @@ class EditTracks(Container):
  
         if self._inspecting:
             self._select_node(index)
+            find_tracks = self._find_tracks_widget()
+            if find_tracks is not None:
+                find_tracks.plot_node_subtree(index)
     
     @staticmethod
     def _is_modified(event, modifier: str) -> bool:
@@ -322,7 +325,7 @@ class EditTracks(Container):
                 coord = np.asarray(layer.world_to_data(np.asarray(event.position)))
                 self._eval_node.vertex[displayed] = coord[displayed]
                 self._manager._is_serialized = False
-                self._manager._view_time_slice = (0, -1)  # invalidate slicing
+                self._manager._view_time_slice = INVALID_TIME_SLICE
                 self._load_eval_visual()
                 self._center_to(self._eval_node.vertex)
                 yield
@@ -796,7 +799,7 @@ class EditTracks(Container):
             self._manager.unlink(neigh_id, None)
 
         self._manager.link(neigh_id, self._eval_node.index)
-        self._manager._view_time_slice = (0, -1)  # invalidate slicing
+        self._manager._view_time_slice = INVALID_TIME_SLICE
         self._tracks_layer.value.refresh()
     
     def _unlink_parent(self) -> None:
@@ -815,7 +818,7 @@ class EditTracks(Container):
         self._manager.unlink(neigh_id, None)
 
         self._manager.link(neigh_id, self._eval_node.index)
-        self._manager._view_time_slice = (0, -1)  # invalidate slicing
+        self._manager._view_time_slice = INVALID_TIME_SLICE
         self._tracks_layer.value.refresh()
     
     def _update_stats(self, event=None) -> None:
@@ -829,3 +832,9 @@ class EditTracks(Container):
         
         self._stats_manager.n_tracks = len(layer._manager)
         self._stats_manager.n_nodes = len(layer.data)
+
+    def _find_tracks_widget(self) -> Optional['FindTracks']:
+        dock_widget = self._viewer.window._dock_widgets.get('track-utils: Find Tracks')
+        if dock_widget is not None:
+            return dock_widget.widget()
+        return None
