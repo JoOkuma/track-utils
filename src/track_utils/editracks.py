@@ -6,15 +6,14 @@ from numpy.typing import ArrayLike
 import napari
 
 from napari.layers import Tracks, Layer
-from napari.layers.tracks._managers._interactive_track_manager import Node, InteractiveTrackManager
+from napari.layers.tracks._managers._interactive_track_manager import Node, InteractiveTrackManager, INVALID_TIME_SLICE
 from napari.layers.utils.plane import ClippingPlane
 from napari.utils.colormaps.standardize_color import _handle_str
-from napari.utils.events import EventedModel
+from napari.utils.events import EventedModel, EmitterGroup, Event
 
-from magicgui.widgets import (
-    Container, create_widget, SpinBox, Slider, PushButton, CheckBox,
-    FileEdit, Textarea
-)
+from magicgui.widgets import Container, create_widget, Slider, PushButton, CheckBox, FileEdit, Textarea
+
+from qtpy.QtWidgets import QMessageBox
 
 from vispy.gloo import VertexBuffer
 from vispy.scene.visuals import Markers
@@ -126,8 +125,16 @@ class EditTracks(Container):
 
         self._pending_additions = []
 
+        self.events = EmitterGroup(
+            source=self,
+            selected_node=Event,
+        )
+
+        self.events.selected_node.connect(self.on_display_selected_node)
+        self.events.selected_node.connect(self.on_center_to_node)
+
         self._hover_visual = Markers(scaling=True)
-        self._eval_visual = Markers(scaling=True)
+        self._selected_visual = Markers(scaling=True)
         self._neighbor_visual = Markers(scaling=True)
         self._vertices_spatial_filter = SpatialFilter(10.0)
         self._graph_spatial_filter = SpatialFilter(10.0)
@@ -141,12 +148,14 @@ class EditTracks(Container):
         self._is_adding = False
 
         self._setup_clipping_planes()
+        self._viewer.layers.events.inserted.connect(self._add_clipping_plane)
 
         self._load_button = PushButton(text='Load', enabled=False)
         self._load_button.changed.connect(self._on_load)
         self.append(self._load_button)
 
-        self._node_radius = SpinBox(max=100, value=10, label='Node Radius')
+        self._node_radius = Slider(min=0, max=100, value=10, label='Node Radius')
+        self._node_radius.changed.connect(lambda _: self.on_display_selected_node())
         self.append(self._node_radius)
 
         self._spatial_range = Slider(min=0, max=500, value=self._vertices_spatial_filter.stack_range,
@@ -159,14 +168,15 @@ class EditTracks(Container):
         self._neighbor_show.changed.connect(lambda _: self._load_neighborhood_visual())
         self.append(self._neighbor_show)
 
-        self._neighbor_radius = SpinBox(min=1, max=25, value=10, label='Neigh. Radius')
+        self._neighbor_radius = Slider(min=1, max=25, value=10, label='Neigh. Radius')
+        self._neighbor_radius.changed.connect(lambda _: self.on_display_selected_node())
         self.append(self._neighbor_radius)
 
         self._bounding_box = CheckBox(text='Bounding Box', value=False, enabled=False)
         self._bounding_box.changed.connect(self._on_bounding_box_change)
         self.append(self._bounding_box)
 
-        self._bbox_size = SpinBox(min=5, max=500, value=25, label='BBox Size')
+        self._bbox_size = Slider(min=5, max=500, value=25, label='BBox Size')
         self._bbox_size.changed.connect(lambda _: self._update_bbox_position())
         self.append(self._bbox_size)
 
@@ -175,13 +185,12 @@ class EditTracks(Container):
 
         self._addition_mode = PushButton(text='Add New Track', enabled=True)
         self._addition_mode.changed.connect(lambda _: setattr(self, '_is_adding', True))
-        self._addition_mode.changed.connect(lambda _: setattr(self, '_inspecting', False))
-        self._addition_mode.changed.connect(lambda _: setattr(self, '_eval_node', None))
+        self._addition_mode.changed.connect(lambda _: setattr(self, 'selected_node', None))
 
         self.append(self._addition_mode)
-        self._add_confirm = PushButton(text='Confirm')
+        self._add_confirm = PushButton(text='Confirm', enabled=False)
         self._add_confirm.changed.connect(lambda _: self._confirm_addition())
-        self._add_cancel = PushButton(text='Cancel')
+        self._add_cancel = PushButton(text='Cancel', enabled=False)
         self._add_cancel.changed.connect(lambda _: self._cancel_addition())
  
         container = Container(layout='horizontal', widgets=[self._add_confirm, self._add_cancel], label='Addition: ')
@@ -220,6 +229,8 @@ class EditTracks(Container):
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
 
+        self.selected_node = None
+
     def _non_visible_spatial_axis(self) -> int:
         return self._viewer.dims.order[-3]
 
@@ -248,7 +259,7 @@ class EditTracks(Container):
         return predecessors
 
     def _on_hover(self, layer: Tracks, event) -> None:
-        if not self._inspecting or not self._is_2d():
+        if not self.is_inspecting or not self._is_2d():
             return
 
         coord = layer.world_to_data(np.asarray(event.position))
@@ -257,15 +268,17 @@ class EditTracks(Container):
             self._make_empty(self._hover_visual)
             return
         
-        node = layer._manager._get_node(index)
+        self.display_node_tail(self._get_node(index))
+        
+    def display_node_tail(self, node: Node) -> None:
         preds = self._get_node_predecessors(node, self._node_t_trail_length)
         track = np.stack([n.vertex for n in preds])
 
-        relative_t = ((track[:, 0] - coord[0]) + self._node_t_trail_length) / self._node_t_trail_length
+        relative_t = ((track[:, 0] - node.time) + self._node_t_trail_length) / self._node_t_trail_length
         selected = np.logical_and(relative_t > 0, relative_t <= 1.0)
 
         s_idx = self._non_visible_spatial_axis()
-        relative_s = (self._node_spatial_trail_length - np.abs(track[:, s_idx] - coord[s_idx])) / self._node_spatial_trail_length
+        relative_s = (self._node_spatial_trail_length - np.abs(track[:, s_idx] - node.vertex[s_idx])) / self._node_spatial_trail_length
 
         track = track[selected][:, 1:]  # picking z, y, x
         size = np.clip(self._node_radius.value * relative_s[selected], 1, None)
@@ -291,24 +304,39 @@ class EditTracks(Container):
         if self._is_adding:
             index = layer._manager.add(coord, {'verified': True})
             self._pending_additions.append(index)
-            if self._eval_node is not None:
-                if self._eval_node.vertex[0] < coord[0]:
-                    parent, child = self._eval_node.index, index
+            if self.selected_node is not None:
+                if self.selected_node.vertex[0] < coord[0]:
+                    parent, child = self.selected_node.index, index
                 else:
-                    parent, child = index, self._eval_node.index
-                self._manager.link(parent, child)
-            self._eval_node = self._get_node(index)
-            self._increment_time(1 - 2 * self._backward_incr.value)
-            self._load_eval_visual()
+                    parent, child = index, self.selected_node.index
+                self._manager.link(child, parent)
+            self.selected_node = self._get_node(index)
+            self._increment_time()
+            self._add_confirm.enabled = True
+            self._add_cancel.enabled = True
             return
 
         index = self._get_index(layer, coord)
         if index is None:
             return
  
-        if self._inspecting:
-            self._select_node(index)
-    
+        if self.is_inspecting:
+            self.selected_node = self._get_node(index)
+            self._make_empty(self._hover_visual)
+   
+    @property
+    def selected_node(self) -> Node:
+        return self._selected_node
+
+    @selected_node.setter
+    def selected_node(self, node: Node) -> None:
+        self._selected_node = node
+        self.events.selected_node(value=node)
+         
+    @property
+    def is_inspecting(self) -> bool:
+        return self.selected_node is None
+
     @staticmethod
     def _is_modified(event, modifier: str) -> bool:
         return len(event.modifiers) == 1 and event.modifiers[0] == modifier
@@ -317,7 +345,7 @@ class EditTracks(Container):
         if not self._is_2d():
             return
         
-        if self._eval_node is not None and self._is_modified(event, 'Shift'):
+        if self.selected_node is not None and self._is_modified(event, 'Shift'):
             coord = layer.world_to_data(np.asarray(event.position))
 
             # FIXME: THIS WORKS, napari's transforms needs to be fixed
@@ -331,27 +359,23 @@ class EditTracks(Container):
 
             while event.type == 'mouse_move':
                 coord = np.asarray(layer.world_to_data(np.asarray(event.position)))
-                self._eval_node.vertex[displayed] = coord[displayed]
+                self.selected_node.vertex[displayed] = coord[displayed]
                 self._manager._is_serialized = False
-                self._manager._view_time_slice = (0, -1)  # invalidate slicing
-                self._load_eval_visual()
+                self._manager._view_time_slice = INVALID_TIME_SLICE
+                self.events.selected_node(value=self.selected_node)
                 yield
             
             self._is_moving = False
 
-    def _select_node(self, index: int) -> None:
-        self._inspecting = False
-        self._make_empty(self._hover_visual)
+    def on_display_selected_node(self, event=None) -> bool:
+        if event is None:
+            node = self.selected_node
+        else:
+            node = event.value
 
-        self._eval_node = self._get_node(index)
-
-        self._load_eval_visual()
-
-    def _load_eval_visual(self) -> bool:
-        node = self._eval_node
         time = self._viewer.dims.point[0]
-        if node is None or abs(node.time - time) > 1:
-            self._make_empty(self._eval_visual)
+        if node is None or abs(node.time - time) >= 1:
+            self._make_empty(self._selected_visual)
             return False
 
         elif node.features.get('verified', False):
@@ -359,11 +383,9 @@ class EditTracks(Container):
         else:
             edge_color = 'white'
 
-        self._center_to(node.vertex)
-
         size = self._node_radius.value
 
-        self._eval_visual.set_data(
+        self._selected_visual.set_data(
             self._to_display(node.vertex[1:]),
             face_color='transparent',
             edge_color=edge_color,
@@ -376,6 +398,11 @@ class EditTracks(Container):
         self._load_neighborhood(next_coord, self._neighbor_radius.value)
         return True
     
+    def on_center_to_node(self, event) -> None:
+        if event.value is None:
+            return
+        self._center_to(event.value.vertex)
+ 
     @property
     def _node_edge_width(self) -> float:
         return self._node_radius.value / 20
@@ -398,15 +425,16 @@ class EditTracks(Container):
         return int(self._tracks_layer.value.world_to_data(step)[0])
 
     def _escape_eval_mode(self) -> None:
+        if self._addition_mode:
+            self._cancel_addition()
         self._reset_eval_tracking()
-        self._reset_neighborhood()
+        self._neighbor_show.value = False
 
     def _reset_eval_tracking(self) -> None:
-        self._inspecting = True
-        self._eval_node = None
+        self.selected_node = None
         self._is_adding = False
         self._pending_additions.clear()
-        self._make_empty(self._eval_visual)
+        self._make_empty(self._selected_visual)
 
     def _load_neighborhood(self, coord: ArrayLike, radius: int) -> None:
         layer: Tracks = self._tracks_layer.value
@@ -442,12 +470,21 @@ class EditTracks(Container):
         self._load_neighborhood_visual()
     
     def _load_neighborhood_visual(self) -> None:
-        if self._neighbor_show.value == False or self._neighbor_vertices is None:
+        if not self._neighbor_show.value or self._neighbor_vertices is None:
             self._make_empty(self._neighbor_visual)
             return
+        
+        self._neighbor_visual.visible = True
 
         edge_color = np.empty((len(self._neighbor_vertices), 4), dtype=np.float32)
         edge_color[...] = _handle_str('yellow')[np.newaxis, ...]
+
+        # coloring orphan nodes
+        manager = self._manager
+        for i, node_id in enumerate(self._neighbor_original_ids):
+            if len(manager._id_to_nodes[node_id].parents) == 0:
+                edge_color[i] = _handle_str('cyan')
+
         edge_color[self._neighbor_selected_id] = _handle_str('magenta')
 
         self._neighbor_visual.set_data(
@@ -515,16 +552,27 @@ class EditTracks(Container):
 
         return nearest
     
-    def _increment_time(self, step: int) -> None:
-        self._viewer.dims.set_current_step(0, self._viewer.dims.current_step[0] + step)
-        time = self._viewer.dims.point[0]
-        if self._eval_node:
-            if step > 0:
-                self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
-            else:
-                self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
-
-        self._load_eval_visual()
+    def _increment_time(self, step: Optional[int] = None, center: bool = False) -> None:
+        if step is None:
+            # if step is not provided it increments given the direction
+            step = 1 - 2 * self._backward_incr.value
+        
+        time = self._viewer.dims.point[0] + step
+        update_display = True
+        if self.selected_node is not None:
+            with self.events.selected_node.blocker():
+                if step > 0:
+                    self.selected_node = self._search_time_point(self.selected_node, time, lambda x: x.children)
+                else:
+                    self.selected_node = self._search_time_point(self.selected_node, time, lambda x: x.parents)
+            
+            if center and time == self.selected_node.time:
+                self.events.selected_node(value=self.selected_node)
+                update_display = False
+        
+        self._viewer.dims.set_current_step(0, time)
+        if update_display:
+            self.on_display_selected_node()
 
     def _on_load(self) -> None:
         layer: Tracks = self._tracks_layer.value
@@ -542,7 +590,7 @@ class EditTracks(Container):
 
         self._on_tracks_change()
 
-        aux_visuals = [self._hover_visual, self._eval_visual, self._neighbor_visual]
+        aux_visuals = [self._hover_visual, self._selected_visual, self._neighbor_visual]
         visual = self._viewer.window.qt_viewer.layer_to_visual[layer]
         self._node = visual.node
         for visual in aux_visuals:
@@ -569,16 +617,18 @@ class EditTracks(Container):
         layer.mouse_move_callbacks.append(self._on_hover)
         layer.mouse_drag_callbacks.append(self._on_drag)
 
-        layer.bind_key('N', lambda _: self._increment_time(-1), overwrite=True)
-        layer.bind_key('M', lambda _: self._increment_time(+1), overwrite=True)
+        layer.bind_key('N', lambda _: self._increment_time(-1, center=True), overwrite=True)
+        layer.bind_key('M', lambda _: self._increment_time(+1, center=True), overwrite=True)
 
         layer.bind_key('C', lambda _: self._set_verified_status(True), overwrite=True)
         layer.bind_key('X', lambda _: self._set_verified_status(False), overwrite=True)
 
         layer.bind_key('K', lambda _: self._increment_neighbor_selected_index(-1), overwrite=True)
         layer.bind_key('L', lambda _: self._increment_neighbor_selected_index(+1), overwrite=True)
+
         layer.bind_key('A', lambda _: self._add_link_to_neigh(), overwrite=True)
         layer.bind_key('S', lambda _: self._switch_link_to_neigh(), overwrite=True)
+        layer.bind_key('U', lambda _: self._unlink_parent(), overwrite=True)
 
         layer.bind_key('F', lambda _: self._focus_to_current_track(), overwrite=True)
         layer.bind_key('D', lambda _: self._delete_eval_node(), overwrite=True)
@@ -590,7 +640,7 @@ class EditTracks(Container):
         if layer == self._tracks_layer.value:
             visual = self._viewer.window.qt_viewer.layer_to_visual[layer]
             visual.node.remove_subvisual(self._hover_visual)
-            visual.node.remove_subvisual(self._eval_visual)
+            visual.node.remove_subvisual(self._selected_visual)
             visual.node.remove_subvisual(self._neighbor_visual)
             visual.node._subvisuals[0].detach(self._vertices_spatial_filter)
             visual.node._subvisuals[2].detach(self._graph_spatial_filter)
@@ -620,10 +670,10 @@ class EditTracks(Container):
             self._vertices_spatial_filter.stack_range = 0
             self._graph_spatial_filter.stack_range = 0
             self._hover_visual.visible = False
-            if self._eval_node is None:
-                self._eval_visual.visible = False
+            if self.selected_node is None:
+                self._selected_visual.visible = False
             self._bounding_box.enabled = True
-            if self._neighbor_original_ids is None:
+            if not self._validate_link_to_neigh():
                 self._neighbor_visual.visible = False
 
             if self._node._subvisuals[2].bounds(0) is None:
@@ -632,22 +682,21 @@ class EditTracks(Container):
             self._vertices_spatial_filter.stack_range = self._spatial_range.value
             self._graph_spatial_filter.stack_range = self._spatial_range.value
             self._hover_visual.visible = True
-            self._eval_visual.visible = True
+            self._selected_visual.visible = True
             self._neighbor_visual.visible = True
             self._bounding_box.value = False
             self._bounding_box.enabled = False
             self._node._subvisuals[2].visible = True
          
-        self._load_eval_visual()
-        self._load_neighborhood_visual()
+        self.on_display_selected_node()
    
     def _delete_eval_node(self) -> None:
         """Delete node and splits the path"""
         layer: Tracks = self._tracks_layer.value
-        if layer is None or self._eval_node is None:
+        if layer is None or self.selected_node is None:
             return
         
-        node = self._eval_node
+        node = self.selected_node
         if node.features.get('verified', False):
             warnings.warn('Deleting `verified` node is not allowed.')
             return
@@ -655,6 +704,7 @@ class EditTracks(Container):
         layer._manager.remove(node.index)
 
         self._stats_manager.n_deleted += 1
+        self._stats_manager.n_nodes -= 1
         self._escape_eval_mode()
 
     def _on_bounding_box_change(self, status: bool):
@@ -664,14 +714,14 @@ class EditTracks(Container):
             layer.refresh()
     
     def _update_bbox_position(self) -> None:
-        node = self._eval_node
+        node = self.selected_node
         if node is None:
             return
         
         coord = node.vertex
         for layer in self._viewer.layers:
             for plane in layer.experimental_clipping_planes:
-                position = np.flip(coord[1:]) - np.asarray(plane.normal) * self._bbox_size.value / 2
+                position = coord[1:] - np.asarray(plane.normal) * self._bbox_size.value / 2
                 plane.position = position
             layer.refresh()
         
@@ -682,28 +732,35 @@ class EditTracks(Container):
             'enabled': False,
         }
 
-        bbox_planes = []
+        self._bbox_planes = []
         for axis in range(3):
             for direction in (-1, 1):
                 params = default_params.copy()
                 params['normal'] = params['normal'].copy()
                 params['normal'][axis] = direction
-                bbox_planes.append(ClippingPlane(**params))
+                self._bbox_planes.append(ClippingPlane(**params))
         
         for layer in self._viewer.layers:
-            layer.experimental_clipping_planes = bbox_planes
+            layer.experimental_clipping_planes = self._bbox_planes
+    
+    def _add_clipping_plane(self, event) -> None:
+        event.value.experimental_clipping_planes = self._bbox_planes
 
     def _set_verified_status(self, status: bool) -> None:
-        node = self._eval_node
+        node = self.selected_node
         if node is None:
+            return
+        
+        if node.features.get('verified') == status:
             return
 
         node.features['verified'] = status
         if status:
             self._stats_manager.n_verified += 1
-            self._increment_time(1 - 2 * self._backward_incr.value)
+            self._increment_time(center=True)
         else:
             self._stats_manager.n_verified -= 1
+            self.on_display_selected_node()
 
     def _save_verified(self, path: Path) -> None:
         if not path or not str(path).endswith('.csv'):
@@ -721,22 +778,21 @@ class EditTracks(Container):
         df.to_csv(path, index=False, header=True)
     
     def _focus_to_current_track(self) -> None:
-        if self._eval_node is None:
+        if self.selected_node is None:
             return
         
         time = self._viewer.dims.point[0]
-        if time < self._eval_node.time:
-            self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
+        if time < self.selected_node.time:
+            self.selected_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
         else:
-            self._eval_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
-
-        self._center_to(self._eval_node.vertex)
-        self._load_eval_visual()
+            self.selected_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
     
     def _confirm_addition(self) -> None:
         self._stats_manager.n_add += len(self._pending_additions)
         self._reset_eval_tracking()
-
+        self._add_confirm.enabled = False
+        self._add_cancel.enabled = False
+ 
     def _cancel_addition(self) -> None:
         layer: Tracks = self._tracks_layer.value
         if layer is None:
@@ -746,9 +802,16 @@ class EditTracks(Container):
             layer._manager.remove(index)
 
         self._reset_eval_tracking()
+        layer.events.rebuild_tracks()
+        self._add_confirm.enabled = False
+        self._add_cancel.enabled = False
 
     def _validate_link_to_neigh(self) -> bool:
-        return self._neighbor_show.value and len(self._neighbor_original_ids) > 0
+        return (
+            self._neighbor_show.value and
+            self._neighbor_original_ids is not None and
+            len(self._neighbor_original_ids) > 0
+        )
     
     @property
     def _manager(self) -> InteractiveTrackManager:
@@ -760,19 +823,39 @@ class EditTracks(Container):
             return
        
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
-        self._manager.link(neigh_id, self._eval_node.index)
+        if len(self._get_node(neigh_id).parents) > 0:
+            msg_box = QMessageBox()
+            answer = msg_box.question(
+                None, "",
+                f"Node {neigh_id} already have a parent.\nDo you want to unlink it?",
+                msg_box.Yes | msg_box.No,
+            )
+            if answer == msg_box.No:
+                return
+            self._manager.unlink(neigh_id, None)
 
-    def _switch_link_to_neigh(self):
+        self._manager.link(neigh_id, self.selected_node.index)
+        self._manager._view_time_slice = INVALID_TIME_SLICE
+        self._tracks_layer.value.refresh()
+    
+    def _unlink_parent(self) -> None:
+        if self.selected_node is None:
+            return
+        
+        self._manager.unlink(self.selected_node.index, None)
+
+    def _switch_link_to_neigh(self) -> None:
         if not self._validate_link_to_neigh():
             return
         
         neigh_id = self._neighbor_original_ids[self._neighbor_selected_id]
 
-        for child in self._eval_node.children:
-            child.parents.remove(self._eval_node)
+        self._manager.unlink(None, self.selected_node.index)
+        self._manager.unlink(neigh_id, None)
 
-        self._eval_node.children.clear()
-        self._manager.link(neigh_id, self._eval_node.index)
+        self._manager.link(neigh_id, self.selected_node.index)
+        self._manager._view_time_slice = INVALID_TIME_SLICE
+        self._tracks_layer.value.refresh()
     
     def _update_stats(self, event=None) -> None:
         self._stats.value = str(self._stats_manager)
@@ -785,3 +868,9 @@ class EditTracks(Container):
         
         self._stats_manager.n_tracks = len(layer._manager)
         self._stats_manager.n_nodes = len(layer.data)
+
+    def _find_tracks_widget(self) -> Optional['FindTracks']:
+        dock_widget = self._viewer.window._dock_widgets.get('track-utils: Find Tracks')
+        if dock_widget is not None:
+            return dock_widget.widget()
+        return None
