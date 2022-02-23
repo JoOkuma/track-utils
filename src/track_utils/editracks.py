@@ -203,6 +203,20 @@ class EditTracks(Container):
 
         self._update_stats()
 
+        shortcuts_txt = "M: Next node\n" +\
+                        "N: Previous node\n" +\
+                        "C: Confirm node\n" +\
+                        "X: Unconfirm node\n" +\
+                        "L: Next neighbor\n" +\
+                        "K: Previous neighbor\n" +\
+                        "A: Add link to neighbor\n" +\
+                        "S: Switch link to neighbor\n" +\
+                        "F: Focus to current track node\n" +\
+                        "D: Delete node\n" +\
+                        "Esc: Escape selected track\n"
+
+        self._shortcuts_dialog = Textarea(label='Shortcuts', enabled=False, value=shortcuts_txt)
+
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
 
@@ -401,7 +415,7 @@ class EditTracks(Container):
 
         coord = np.asarray(coord)
 
-        nodes = layer._manager._time_to_nodes[int(round(coord[0]))]
+        nodes = layer._manager._time_to_nodes.get(int(round(coord[0])), [])
 
         if len(nodes) == 0:
             self._reset_neighborhood()
@@ -458,10 +472,13 @@ class EditTracks(Container):
         self._neighbor_vertices = None
         self._make_empty(self._neighbor_visual)
     
-    def _get_index(self, layer: Tracks, coord: ArrayLike, radius: int = 5) -> Optional[int]:
+    def _get_index(self, layer: Tracks, coord: ArrayLike, radius: int = 25) -> Optional[int]:
         coord = np.asarray(coord)
 
         index = layer.get_value(coord)
+        if index is None:
+            return
+
         distance = np.linalg.norm(
             layer._manager._id_to_nodes[index].vertex - coord
         )
@@ -586,7 +603,7 @@ class EditTracks(Container):
         layer: Tracks =  self._tracks_layer.value
         g_vertices = layer._view_graph_vertices
         self._vertices_spatial_filter.vertex_stack = layer._view_track_vertices[:, self._non_visible_spatial_axis()]
-        if g_vertices is not None:
+        if g_vertices is not None and len(g_vertices) > 0:
             self._graph_spatial_filter.vertex_stack = g_vertices[:, self._non_visible_spatial_axis()]
     
     def _update_current_slice(self) -> None:
@@ -603,7 +620,7 @@ class EditTracks(Container):
             self._vertices_spatial_filter.stack_range = 0
             self._graph_spatial_filter.stack_range = 0
             self._hover_visual.visible = False
-            if self._eval_track_id is None:
+            if self._eval_node is None:
                 self._eval_visual.visible = False
             self._bounding_box.enabled = True
             if self._neighbor_original_ids is None:
