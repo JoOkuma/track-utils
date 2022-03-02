@@ -783,9 +783,9 @@ class EditTracks(Container):
         
         time = self._viewer.dims.point[0]
         if time < self.selected_node.time:
-            self.selected_node = self._search_time_point(self._eval_node, time, lambda x: x.parents)
+            self.selected_node = self._search_time_point(self.selected_node, time, lambda x: x.parents)
         else:
-            self.selected_node = self._search_time_point(self._eval_node, time, lambda x: x.children)
+            self.selected_node = self._search_time_point(self.selected_node, time, lambda x: x.children)
     
     def _confirm_addition(self) -> None:
         self._stats_manager.n_add += len(self._pending_additions)

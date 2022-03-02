@@ -1,5 +1,3 @@
-import numpy as np
-
 from track_utils._tests.utils import build_tracks
 import track_utils
 
@@ -17,4 +15,3 @@ def test_edit_tracks_load(make_napari_viewer, napari_plugin_manager):
     data = build_tracks()
     viewer.add_tracks(data.values)
     widget._on_load()
-    widget._select(5)

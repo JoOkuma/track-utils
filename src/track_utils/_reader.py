@@ -48,7 +48,7 @@ def read_csv(path: str):
         if colname not in TRACKS_HEADER
     }
     
-    kwargs = {'properties': props}
+    kwargs = {'features': pd.DataFrame(props)}
 
     # optional step:
     if 'ParentTrackID' in df.columns:

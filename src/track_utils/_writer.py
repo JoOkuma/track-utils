@@ -25,7 +25,7 @@ def tracks_to_dataframe(
 
     if graph:
         nan = (m.nan,)
-        df['ParentTrackID'] = df['TrackID'].map(lambda k: graph.get(k, default=nan)[0])
+        df['ParentTrackID'] = df['TrackID'].map(lambda k: graph.get(k, nan)[0])
     
     if features:
         for k, v in features.items():
