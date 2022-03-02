@@ -67,8 +67,8 @@ class SelectTracks(Container):
 
         assert mask.shape == segms.shape
 
+        selected_node_ids = set()
         if isinstance(mask, zarr.Array):
-            selected_node_ids = set()
             for key in progress(list(get_initialized_keys(mask))):
                 slicing = zarr_key_to_slice(mask, key)
                 c_mask = mask[slicing]
