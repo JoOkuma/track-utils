@@ -133,6 +133,7 @@ class EditTracks(Container):
         self.events.selected_node.connect(self.on_display_selected_node)
         self.events.selected_node.connect(self.on_center_to_node)
 
+        self._node = None
         self._hover_visual = Markers(scaling=True)
         self._selected_visual = Markers(scaling=True)
         self._neighbor_visual = Markers(scaling=True)
@@ -225,6 +226,7 @@ class EditTracks(Container):
                         "Esc: Escape selected track\n"
 
         self._shortcuts_dialog = Textarea(label='Shortcuts', enabled=False, value=shortcuts_txt)
+        self.append(self._shortcuts_dialog)
 
         self._tracks_layer.changed.connect(lambda v: setattr(self._load_button, 'enabled', v is not None))
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
@@ -283,8 +285,10 @@ class EditTracks(Container):
         track = track[selected][:, 1:]  # picking z, y, x
         size = np.clip(self._node_radius.value * relative_s[selected], 1, None)
 
+        validated = np.asarray([n.features.get('verified', False) for n in preds])[selected]
         edge_color = np.empty((len(size), 4), dtype=np.float32)
         edge_color[...] = _handle_str('white')[np.newaxis, ...]
+        edge_color[validated, ...] = _handle_str('green')
         edge_color[:, -1] = relative_t[selected]
 
         self._hover_visual.set_data(
@@ -588,8 +592,6 @@ class EditTracks(Container):
         else:
             self._stats_manager.n_verified = 0
 
-        self._on_tracks_change()
-
         aux_visuals = [self._hover_visual, self._selected_visual, self._neighbor_visual]
         visual = self._viewer.window.qt_viewer.layer_to_visual[layer]
         self._node = visual.node
@@ -609,8 +611,14 @@ class EditTracks(Container):
         # layer.events.rebuild_graph.connect(self._update_stats_n_tracks)
         self._update_stats_n_tracks()
 
+        layer.events.rebuild_graph()
+        layer.events.rebuild_tracks()
+        self._on_tracks_change()
+
         layer.events.rebuild_graph.connect(self._on_tracks_change)
         layer.events.rebuild_tracks.connect(self._on_tracks_change)
+        # self._setup_track_update_events()
+
         self._spatial_range.changed.connect(lambda _: layer.refresh())
 
         layer.mouse_double_click_callbacks.append(self._on_double_click)
@@ -676,7 +684,7 @@ class EditTracks(Container):
             if not self._validate_link_to_neigh():
                 self._neighbor_visual.visible = False
 
-            if self._node._subvisuals[2].bounds(0) is None:
+            if self._node is not None and self._node._subvisuals[2].bounds(0) is None:
                 self._node._subvisuals[2].visible = False
         else:
             self._vertices_spatial_filter.stack_range = self._spatial_range.value
